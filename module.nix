@@ -4,15 +4,15 @@ let
   cfg = config.services.qrMail;
 
   python = pkgs.python3.withPackages (ps: [
-    ps.pillow      # image loading
-    ps.pyzbar      # QR code detection (wraps ZBar)
-    ps.pdf2image   # renders PDF pages via poppler
-    ps.segno       # QR code generation with ECI support
+    ps.pillow # image loading
+    ps.pyzbar # QR code detection (wraps ZBar)
+    ps.pdf2image # renders PDF pages via poppler
+    ps.segno # QR code generation with ECI support
   ]);
 
   # Bundle all Python source files into one store path so imports resolve
   # correctly (Python adds the script directory to sys.path automatically).
-  src = pkgs.runCommandLocal "qr-mail-src" {} ''
+  src = pkgs.runCommandLocal "qr-mail-src" { } ''
     mkdir $out
     cp ${./mail_processor.py} $out/mail_processor.py
     cp ${./upn.py}            $out/upn.py
@@ -62,7 +62,7 @@ in
 
     allowedSenders = lib.mkOption {
       type = lib.types.listOf lib.types.str;
-      default = [];
+      default = [ ];
       example = [
         "*@trusted.com"
         "billing@vendor.tld"
@@ -76,7 +76,7 @@ in
 
     allowedSenderRoutes = lib.mkOption {
       type = lib.types.listOf lib.types.str;
-      default = [];
+      default = [ ];
       example = [
         "*@trusted.com=foo@bar.com,baz1@domain.com"
         "billing@vendor.tld=accounts@myco.tld"
@@ -92,7 +92,7 @@ in
 
     trustedSenders = lib.mkOption {
       type = lib.types.listOf lib.types.str;
-      default = [];
+      default = [ ];
       example = [ "ceo@*" "*@partner.com" ];
       description = ''
         Like allowedSenders, but when matched the tool replies to the sender and
@@ -102,7 +102,7 @@ in
 
     maxAttachmentBytes = lib.mkOption {
       type = lib.types.int;
-      default = 104857600;  # 100 MB
+      default = 104857600; # 100 MB
       description = "Maximum size in bytes of a single attachment to scan for QR codes.";
     };
 
@@ -175,7 +175,7 @@ in
       group = "qr-mail";
       description = "qr-mail Postfix pipe user";
     };
-    users.groups.qr-mail = {};
+    users.groups.qr-mail = { };
 
     services.postfix.settings.master."qr-mail" = {
       type = "unix";
