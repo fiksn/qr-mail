@@ -21,6 +21,11 @@ Configuration via environment variables:
   PDFINFO_TIMEOUT_S      pdfinfo timeout seconds when checking PDF encryption (default: 3)
   MAX_IMAGE_PIXELS       PIL image pixel limit / decompression bomb guard (default: 40000000)
   MAX_MESSAGE_RUNTIME_S  max total processing time per message (default: 60)
+  SMTP_HOST              if set, send via SMTP instead of sendmail
+  SMTP_PORT              SMTP port (default: 587)
+  SMTP_USER              SMTP username for auth (optional)
+  SMTP_PASSWORD          SMTP password for auth (optional)
+  SMTP_TLS               TLS mode: starttls (default), tls (implicit/SMTPS), or none
 
 Standalone usage:
   ADMIN_EMAIL=admin@example.com \
@@ -78,6 +83,15 @@ DEFAULT_PDF_RENDER_TIMEOUT_S = 20
 DEFAULT_MAX_IMAGE_PIXELS = 40_000_000
 DEFAULT_MAX_MESSAGE_RUNTIME_S = 60
 DEFAULT_PDFINFO_TIMEOUT_S = 3
+
+
+@dataclass
+class SmtpConfig:
+    host: str
+    port: int
+    user: str
+    password: str
+    tls: str  # "starttls", "tls", or "none"
 
 
 class MessageProcessingTimeout(RuntimeError):
@@ -621,6 +635,48 @@ def build_forward(
     return fwd
 
 
+def _load_smtp_config() -> Optional[SmtpConfig]:
+    host = os.environ.get("SMTP_HOST", "").strip()
+    if not host:
+        return None
+    return SmtpConfig(
+        host=host,
+        port=int(os.environ.get("SMTP_PORT", "587")),
+        user=os.environ.get("SMTP_USER", ""),
+        password=os.environ.get("SMTP_PASSWORD", ""),
+        tls=os.environ.get("SMTP_TLS", "starttls").lower(),
+    )
+
+
+def _send_mail(
+    fwd: MIMEMultipart,
+    my_address: str,
+    recipients: list[str],
+    smtp_cfg: Optional[SmtpConfig],
+) -> None:
+    """Send the forwarded message via sendmail or SMTP."""
+    msg_bytes = fwd.as_bytes()
+    if smtp_cfg is None:
+        # Inject via sendmail binary — queues directly into Postfix spool,
+        # no live SMTP connection needed. On NixOS: /run/wrappers/bin/sendmail
+        subprocess.run(["sendmail", "-f", my_address, *recipients], input=msg_bytes, check=True)
+        return
+
+    log.debug("SMTP: connecting to %s:%d (tls=%s)", smtp_cfg.host, smtp_cfg.port, smtp_cfg.tls)
+    if smtp_cfg.tls == "tls":
+        conn: smtplib.SMTP = smtplib.SMTP_SSL(smtp_cfg.host, smtp_cfg.port)
+    else:
+        conn = smtplib.SMTP(smtp_cfg.host, smtp_cfg.port)
+
+    with conn:
+        if smtp_cfg.tls == "starttls":
+            conn.starttls()
+        if smtp_cfg.user:
+            conn.login(smtp_cfg.user, smtp_cfg.password)
+        conn.sendmail(my_address, recipients, msg_bytes)
+        log.debug("SMTP: sent to %s", recipients)
+
+
 def main() -> None:
     admin_email, my_address, allowed_raw, routes_raw, trusted_senders, max_bytes = load_config()
     allowed_patterns = parse_allowed_senders(allowed_raw)
@@ -683,23 +739,15 @@ def main() -> None:
         payments=payments,
     )
 
-    # Inject via sendmail binary — queues directly into Postfix spool,
-    # no live SMTP connection needed. On NixOS: /run/wrappers/bin/sendmail
     if is_trusted:
         recipients = [sender_addr, admin_email]
+    elif to_addrs:
+        recipients = [*to_addrs, admin_email]
     else:
         recipients = [admin_email]
-        if to_addrs:
-            recipients = [*to_addrs, admin_email]
-        else:
-            recipients = [admin_email]
 
     recipients = list(dict.fromkeys(recipients))  # dedupe, preserve order
-    subprocess.run(["sendmail", "-f", my_address, *recipients], input=fwd.as_bytes(), check=True)
-
-    # Alternative: send via SMTP to localhost:25 (requires localhost in mynetworks)
-    # with smtplib.SMTP("localhost") as smtp:
-    #     smtp.sendmail(my_address, [admin_email], fwd.as_bytes())
+    _send_mail(fwd, my_address, recipients, _load_smtp_config())
 
 
 if __name__ == "__main__":

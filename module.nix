@@ -8,6 +8,8 @@ let
     ps.pyzbar # QR code detection (wraps ZBar)
     ps.pdf2image # renders PDF pages via poppler
     ps.segno # QR code generation with ECI support
+    ps.google-api-python-client # Gmail API (gmail_fetch.py)
+    ps.google-auth # service account credentials
   ]);
 
   # Bundle all Python source files into one store path so imports resolve
@@ -19,6 +21,7 @@ let
     cp ${./epc.py}            $out/epc.py
     cp ${./generate.py}       $out/generate.py
     cp ${./routing.py}        $out/routing.py
+    cp ${./gmail_fetch.py}    $out/gmail_fetch.py
   '';
 
   # Shell wrapper that sets env vars and invokes the Python script.
@@ -38,7 +41,21 @@ let
     export PDFINFO_TIMEOUT_S=${toString cfg.pdfinfoTimeoutSeconds}
     export MAX_IMAGE_PIXELS=${toString cfg.maxImagePixels}
     export MAX_MESSAGE_RUNTIME_S=${toString cfg.maxMessageRuntimeSeconds}
+    export SMTP_HOST=${lib.escapeShellArg cfg.smtpHost}
+    export SMTP_PORT=${toString cfg.smtpPort}
+    export SMTP_USER=${lib.escapeShellArg cfg.smtpUser}
+    export SMTP_PASSWORD=${lib.escapeShellArg cfg.smtpPassword}
+    export SMTP_TLS=${lib.escapeShellArg cfg.smtpTls}
     exec ${python}/bin/python3 ${src}/mail_processor.py "$@"
+  '';
+  gmailFetcherBin = pkgs.writeShellScriptBin "qr-mail-gmail-fetch" ''
+    export GMAIL_IMPERSONATE_ADDRESS=${lib.escapeShellArg cfg.gmailImpersonateAddress}
+    export GMAIL_POLL_INTERVAL_S=${toString cfg.gmailPollIntervalSeconds}
+    export GMAIL_PROCESSED_LABEL=${lib.escapeShellArg cfg.gmailProcessedLabel}
+    export PROCESSOR_BIN=${processorBin}/bin/qr-mail-processor
+    # Service account file path is passed at runtime via GMAIL_SERVICE_ACCOUNT_FILE
+    # so that the secret never lands in the Nix store.
+    exec ${python}/bin/python3 ${src}/gmail_fetch.py "$@"
   '';
 in
 {
@@ -167,6 +184,93 @@ in
         EPC does not carry a recipient city, which is mandatory in UPN.
       '';
     };
+
+    smtpHost = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      description = ''
+        SMTP server hostname. When set, outbound mail is sent via SMTP instead
+        of the local sendmail binary. Leave empty to use sendmail (default).
+      '';
+    };
+
+    smtpPort = lib.mkOption {
+      type = lib.types.port;
+      default = 587;
+      description = "SMTP server port (default: 587 for STARTTLS).";
+    };
+
+    smtpUser = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      description = "SMTP username for authentication. Leave empty to skip auth.";
+    };
+
+    smtpPassword = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      description = ''
+        SMTP password for authentication.
+
+        Warning: this value lands in the Nix store as world-readable plain text.
+        For production use, supply the password via an environment file outside
+        the store (e.g. sops-nix or systemd EnvironmentFile).
+      '';
+    };
+
+    smtpTls = lib.mkOption {
+      type = lib.types.enum [ "starttls" "tls" "none" ];
+      default = "starttls";
+      description = ''
+        TLS mode for outbound SMTP:
+        - <literal>starttls</literal>: STARTTLS upgrade on connect (default, port 587)
+        - <literal>tls</literal>: implicit TLS / SMTPS (port 465)
+        - <literal>none</literal>: plain SMTP, no encryption
+      '';
+    };
+
+    gmailServiceAccountFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      example = "/run/secrets/qr-mail-service-account.json";
+      description = ''
+        Path to a Google service account JSON key file with domain-wide
+        delegation enabled for the Gmail API. When set, a polling daemon
+        (<literal>qr-mail-gmail-fetch</literal>) is started alongside the
+        Postfix pipe handler.
+
+        The file must be readable by the <literal>qr-mail</literal> system
+        user. Use a secrets manager (e.g. sops-nix) so the key does not land
+        in the Nix store.
+      '';
+    };
+
+    gmailImpersonateAddress = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      example = "qr@yourdomain.com";
+      description = ''
+        Google Workspace address the service account impersonates via
+        domain-wide delegation. Must match the inbox that receives payment
+        mail.
+      '';
+    };
+
+    gmailPollIntervalSeconds = lib.mkOption {
+      type = lib.types.int;
+      default = 60;
+      description = "Seconds between Gmail inbox polls.";
+    };
+
+    gmailProcessedLabel = lib.mkOption {
+      type = lib.types.str;
+      default = "qr-mail-processed";
+      description = ''
+        Gmail label applied to messages after successful processing.
+        The label is created automatically on first run if it does not exist.
+        It is hidden from the label list to keep the inbox tidy.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -177,7 +281,7 @@ in
     };
     users.groups.qr-mail = { };
 
-    services.postfix.settings.master."qr-mail" = {
+    services.postfix.settings.master."qr-mail" = lib.mkIf (cfg.gmailServiceAccountFile == null) {
       type = "unix";
       privileged = true;
       chroot = false;
@@ -189,13 +293,37 @@ in
       ];
     };
 
-    mailserver.extraVirtualAliases = lib.mkIf cfg.catchAllWorkaround {
-      "${cfg.myAddress}" = "qr-mail-pipe@localhost";
-    };
+    mailserver.extraVirtualAliases =
+      lib.mkIf (cfg.catchAllWorkaround && cfg.gmailServiceAccountFile == null) {
+        "${cfg.myAddress}" = "qr-mail-pipe@localhost";
+      };
 
-    services.postfix.transport =
-      if cfg.catchAllWorkaround
-      then "qr-mail-pipe@localhost  qr-mail:\n"
-      else "${cfg.myAddress}  qr-mail:\n";
+    services.postfix.transport = lib.mkIf (cfg.gmailServiceAccountFile == null)
+      (if cfg.catchAllWorkaround
+       then "qr-mail-pipe@localhost  qr-mail:\n"
+       else "${cfg.myAddress}  qr-mail:\n");
+
+    systemd.services.qr-mail-gmail-fetch = lib.mkIf (cfg.gmailServiceAccountFile != null) {
+      description = "qr-mail Gmail fetch daemon";
+      after = [ "network-online.target" ];
+      wants = [ "network-online.target" ];
+      wantedBy = [ "multi-user.target" ];
+      serviceConfig = {
+        Type = "simple";
+        User = "qr-mail";
+        Group = "qr-mail";
+        ExecStart = "${gmailFetcherBin}/bin/qr-mail-gmail-fetch";
+        # Service account file is injected here so it never enters the Nix store.
+        Environment = "GMAIL_SERVICE_ACCOUNT_FILE=${cfg.gmailServiceAccountFile}";
+        Restart = "on-failure";
+        RestartSec = "30s";
+        # Hardening
+        NoNewPrivileges = true;
+        PrivateTmp = true;
+        ProtectSystem = "strict";
+        ProtectHome = true;
+        ReadOnlyPaths = [ cfg.gmailServiceAccountFile ];
+      };
+    };
   };
 }

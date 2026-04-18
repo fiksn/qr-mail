@@ -28,3 +28,19 @@ services.qrMail = {
 ## Other uses
 
 You can still use the python tooling independently of Nix. To convert or craft payment QR codes.
+
+## Google Workspace Fetching
+
+Alternatively instead of postfix this tool can use Google Workspace API as well.
+
+### Setup steps (one-time, manual)
+
+1. Google Cloud Console
+  - New project → enable Gmail API
+  - IAM → Service Accounts → Create → download JSON key
+2. Google Workspace Admin (admin.google.com)
+  - Security → Access and data control → API controls → Domain-wide delegation
+  - Add client ID (from client_id field above) with scope:
+https://www.googleapis.com/auth/gmail.modify
+(modify = read + label; readonly if you prefer to mark-read via a separate mechanism)
+3. The dedicated Workspace account (e.g. qr@yourdomain.com) is the address the service account impersonates — it doesn't need any special permissions itself, just needs to exist and receive mail.

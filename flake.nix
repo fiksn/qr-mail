@@ -16,13 +16,15 @@
         default = pkgs.mkShell {
           packages = [
             (pkgs.python3.withPackages (ps: [
-              ps.pillow      # image loading / generation
-              ps.pyzbar      # QR code detection
-              ps.pdf2image   # PDF → image via poppler
-              ps.segno       # QR code generation
-              ps.pytest      # test runner
+              ps.pillow # image loading / generation
+              ps.pyzbar # QR code detection
+              ps.pdf2image # PDF → image via poppler
+              ps.segno # QR code generation
+              ps.pytest # test runner
+              ps.google-api-python-client # Gmail API
+              ps.google-auth # service account credentials
             ]))
-            pkgs.poppler-utils  # pdfinfo + pdftoppm (runtime dep of pdf2image)
+            pkgs.poppler-utils # pdfinfo + pdftoppm (runtime dep of pdf2image)
           ];
         };
       });
