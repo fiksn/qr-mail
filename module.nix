@@ -149,10 +149,13 @@ in
         Enable when the mailserver uses a catch-all rule that intercepts
         <option>myAddress</option> before Postfix transport rules can match it.
 
-        When true, adds an alias mapping <option>myAddress</option> to a
-        local-only address (<literal>qr-mail-pipe@localhost</literal>) and
-        routes that address to the pipe instead. The alias is processed before
-        catch-all rules, so the pipe receives the mail correctly.
+        Adds <option>myAddress</option> to <literal>mailserver.extraVirtualAliases</literal>
+        pointing to <literal>qr-mail-pipe@localhost</literal>, and routes that
+        address to the pipe via the transport map. Because the alias lands in
+        the same virtual alias map file as the catch-all, Postfix resolves the
+        specific address first and the pipe receives the mail correctly.
+
+        Requires nixos-mailserver (simple-nixos-mailserver).
       '';
     };
 
@@ -186,9 +189,9 @@ in
       ];
     };
 
-    services.postfix.extraAliases = lib.mkIf cfg.catchAllWorkaround ''
-      ${cfg.myAddress}: qr-mail-pipe@localhost
-    '';
+    mailserver.extraVirtualAliases = lib.mkIf cfg.catchAllWorkaround {
+      "${cfg.myAddress}" = "qr-mail-pipe@localhost";
+    };
 
     services.postfix.transport =
       if cfg.catchAllWorkaround

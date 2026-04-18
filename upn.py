@@ -202,7 +202,11 @@ def _validate_rf_reference(ref: str) -> str:
 
 
 def _si_mod11_check_digit(number: str) -> int:
-    """Return SI (Slovenian) MOD 11 check digit for the provided decimal string."""
+    """Return SI (Slovenian) MOD 11 check digit (ZBS standard, Appendix 3).
+
+    Weights increase from 2 at the rightmost digit leftward.
+    When the result is 10 or 11, the check digit is 0.
+    """
     total = 0
     for i, ch in enumerate(reversed(number)):
         total += (2 + i) * (ord(ch) - 48)
@@ -213,9 +217,131 @@ def _si_mod11_check_digit(number: str) -> int:
     return check
 
 
+def _validate_si_grouped_digits(
+    content: str, min_groups: int, max_groups: int, ref: str, model: str,
+) -> None:
+    """Validate grouped-digit structure: hyphens, group count, digit-only groups."""
+    if len(content) > 22:
+        raise UPNReferenceError(
+            f"SI{model} content too long ({len(content)} > 22): {ref!r}"
+        )
+    if content.startswith("-") or content.endswith("-") or "--" in content:
+        raise UPNReferenceError(f"invalid SI{model} hyphen placement: {ref!r}")
+    parts = content.split("-")
+    if not (min_groups <= len(parts) <= max_groups):
+        raise UPNReferenceError(
+            f"SI{model} requires {min_groups}-{max_groups} groups, "
+            f"got {len(parts)}: {ref!r}"
+        )
+    digit_count = 0
+    for p in parts:
+        if not p.isdigit():
+            raise UPNReferenceError(f"SI{model} group must be digits only: {ref!r}")
+        if not (1 <= len(p) <= 12):
+            raise UPNReferenceError(
+                f"SI{model} group length must be 1-12 digits, got {len(p)}: {ref!r}"
+            )
+        digit_count += len(p)
+    if digit_count > 20:
+        raise UPNReferenceError(
+            f"SI{model} has too many digits ({digit_count} > 20): {ref!r}"
+        )
+
+
+def _validate_checked_span(
+    groups: list[str],
+    span_start: int,
+    span_end: int,
+    model: str,
+    ref: str,
+    *,
+    fixed_length: Optional[int] = None,
+) -> None:
+    """Validate a MOD11 check digit spanning groups[span_start..span_end] (inclusive).
+
+    The check digit is the last digit of groups[span_end].
+    Body = concat(groups[span_start..span_end-1]) + groups[span_end][:-1].
+    fixed_length: if set, groups[span_end] must be exactly this many digits.
+    """
+    last_group = groups[span_end]
+    if fixed_length is not None and len(last_group) != fixed_length:
+        raise UPNReferenceError(
+            f"SI{model} P{span_start + 1} must be exactly {fixed_length} digits, "
+            f"got {len(last_group)}: {ref!r}"
+        )
+    if len(last_group) < 2:
+        raise UPNReferenceError(
+            f"SI{model} P{span_end + 1} must have at least 2 digits "
+            f"(includes check digit): {ref!r}"
+        )
+    body = "".join(groups[span_start:span_end]) + last_group[:-1]
+    expected = _si_mod11_check_digit(body)
+    actual = ord(last_group[-1]) - 48
+    if actual != expected:
+        raise UPNReferenceError(
+            f"invalid SI{model} reference checksum: {ref!r} "
+            f"(expected last digit {expected})"
+        )
+
+
+# ── SI model table (ZBS, June 2011) ──────────────────────────────────────────
+#
+# Each entry: (min_groups, max_groups, fixed_spans)
+# fixed_span: (span_start, span_end, fixed_length_or_None)
+#   span_start..span_end are group indices (0-based) covered by one MOD11 check.
+#   fixed_length: if set, the last group of the span must be exactly N digits.
+#
+# Models with a variable span end (01, 06, 09, 10) and special cases (12, 99)
+# are handled explicitly in _validate_si_reference below.
+
+_FixedSpan = tuple[int, int, Optional[int]]  # (start, end, fixed_length)
+_ModelDef = tuple[int, int, list[_FixedSpan]]  # (min_groups, max_groups, spans)
+
+_SI_MODEL_DEFS: dict[str, _ModelDef] = {
+    # P1 free,  P2 check,  P3 check
+    "02": (3, 3, [(1, 1, None), (2, 2, None)]),
+    # P1 check, P2 check,  P3 check
+    "03": (3, 3, [(0, 0, None), (1, 1, None), (2, 2, None)]),
+    # P1 check, P2 free,   P3 check
+    "04": (3, 3, [(0, 0, None), (2, 2, None)]),
+    # P1 check, P2 free,   P3 free
+    "05": (1, 3, [(0, 0, None)]),
+    # P1 free,  P2 check,  P3 free
+    "07": (2, 3, [(1, 1, None)]),
+    # (P1-P2) combined check, P3 check
+    "08": (3, 3, [(0, 1, None), (2, 2, None)]),
+    # P1 check, P2 check,  P3 free
+    "11": (2, 3, [(0, 0, None), (1, 1, None)]),
+    "18": (2, 3, [(0, 0, None), (1, 1, None)]),
+    # P1 check (8-digit tax ID), P2 check, P3 free
+    "19": (2, 3, [(0, 0, 8),    (1, 1, None)]),
+    # P1 check, P2 free
+    "21": (2, 2, [(0, 0, None)]),
+    # P1 check, P2 check,  P3 free
+    "28": (2, 3, [(0, 0, None), (1, 1, None)]),
+    # P1 check, P2 free
+    "31": (2, 2, [(0, 0, None)]),
+    # P1 check, P2 check,  P3 free
+    "38": (2, 3, [(0, 0, None), (1, 1, None)]),
+    "40": (2, 3, [(0, 0, None), (1, 1, None)]),
+    "41": (2, 3, [(0, 0, None), (1, 1, None)]),
+    "48": (2, 3, [(0, 0, None), (1, 1, None)]),
+    "49": (2, 3, [(0, 0, None), (1, 1, None)]),
+    "51": (2, 3, [(0, 0, None), (1, 1, None)]),
+    # P1 check, P2 free,   P3 free
+    "55": (1, 3, [(0, 0, None)]),
+    # P1 check, P2 check,  P3 free
+    "58": (2, 3, [(0, 0, None), (1, 1, None)]),
+}
+
+_ALL_SUPPORTED = sorted(
+    {"00", "99", "12"} | set(_SI_MODEL_DEFS) | {"01", "06", "09", "10"}
+)
+
+
 def _validate_si_reference(ref: str) -> str:
     """Validate SI reference 'SI' + model + reference. Returns compact uppercase."""
-    if not re.fullmatch(r"SI\d{2}.+", ref):
+    if not re.fullmatch(r"SI\d{2}.*", ref):
         raise UPNReferenceError(
             f"invalid SI reference format: {ref!r} (expected SIxx...)"
         )
@@ -223,40 +349,25 @@ def _validate_si_reference(ref: str) -> str:
     model = ref[2:4]
     content = ref[4:]
 
-    def validate_grouped_digits(*, min_groups: int = 1, max_groups: int = 3) -> None:
-        # Enforce a sane "electronic" representation:
-        # - digits with up to 2 hyphens (max 3 groups)
-        # - each group 1-12 digits
-        # - total digits <= 20, total length <= 22 (digits + hyphens)
-        if len(content) > 22:
+    # ── Model 99: no content (ZBS spec: 0 groups) ────────────────────────────
+    if model == "99":
+        if content:
             raise UPNReferenceError(
-                f"SI reference too long: {len(content)} > 22 (excluding model): {ref!r}"
+                f"SI99 must have no content after the model number, got {content!r}: {ref!r}"
             )
-        if content.startswith("-") or content.endswith("-") or "--" in content:
-            raise UPNReferenceError(f"invalid SI reference hyphen placement: {ref!r}")
-        parts = content.split("-")
-        if not (min_groups <= len(parts) <= max_groups):
-            raise UPNReferenceError(
-                f"invalid SI reference group count {len(parts)} (expected {min_groups}-{max_groups}): {ref!r}"
-            )
-        digit_count = 0
-        for p in parts:
-            if not p.isdigit():
-                raise UPNReferenceError(f"invalid SI reference (non-digits): {ref!r}")
-            if not (1 <= len(p) <= 12):
-                raise UPNReferenceError(
-                    f"invalid SI reference group length {len(p)} (must be 1-12): {ref!r}"
-                )
-            digit_count += len(p)
-        if digit_count > 20:
-            raise UPNReferenceError(
-                f"invalid SI reference (too many digits {digit_count} > 20): {ref!r}"
-            )
-
-    if model in ("00", "99"):
-        validate_grouped_digits(min_groups=1, max_groups=3)
         return ref
 
+    if not content:
+        raise UPNReferenceError(
+            f"SI{model} requires content after the model number: {ref!r}"
+        )
+
+    # ── Model 00: no check digits ─────────────────────────────────────────────
+    if model == "00":
+        _validate_si_grouped_digits(content, 1, 3, ref, model)
+        return ref
+
+    # ── Model 12: single digits-only group, up to 13 chars, MOD11 ────────────
     if model == "12":
         if not content.isdigit():
             raise UPNReferenceError(
@@ -274,25 +385,50 @@ def _validate_si_reference(ref: str) -> str:
             )
         return ref
 
-    if model == "07":
-        # Model 07: P1 - (P2)K - (P3) where the check digit is the last digit of P2.
-        # 2 mandatory groups (P1, P2), optional third group (P3).
-        validate_grouped_digits(min_groups=2, max_groups=3)
-        p2 = content.split("-")[1]
-        if len(p2) < 2:
-            raise UPNReferenceError(
-                f"SI07 P2 must include a check digit (min 2 digits): {ref!r}"
-            )
-        expected = _si_mod11_check_digit(p2[:-1])
-        actual = ord(p2[-1]) - 48
-        if actual != expected:
-            raise UPNReferenceError(
-                f"invalid SI07 reference checksum in P2: {ref!r} (expected last digit {expected})"
-            )
+    # ── Data-driven fixed-span models ─────────────────────────────────────────
+    if model in _SI_MODEL_DEFS:
+        min_g, max_g, spans = _SI_MODEL_DEFS[model]
+        _validate_si_grouped_digits(content, min_g, max_g, ref, model)
+        groups = content.split("-")
+        for s_start, s_end, fixed_len in spans:
+            _validate_checked_span(groups, s_start, s_end, model, ref, fixed_length=fixed_len)
+        return ref
+
+    # ── Variable-end-span models ──────────────────────────────────────────────
+
+    if model == "01":
+        # (P1 - ... - Pn)K: all groups share one combined check on last digit of last group
+        _validate_si_grouped_digits(content, 1, 3, ref, model)
+        groups = content.split("-")
+        _validate_checked_span(groups, 0, len(groups) - 1, model, ref)
+        return ref
+
+    if model == "06":
+        # P1 - (P2 - ... - Pn)K: P2..last share a combined check
+        _validate_si_grouped_digits(content, 2, 3, ref, model)
+        groups = content.split("-")
+        _validate_checked_span(groups, 1, len(groups) - 1, model, ref)
+        return ref
+
+    if model == "09":
+        # (P1 - P2)K - P3: P1+P2 share a combined check; P3 free
+        # With 1 group: behaves as (P1)K
+        _validate_si_grouped_digits(content, 1, 3, ref, model)
+        groups = content.split("-")
+        _validate_checked_span(groups, 0, min(1, len(groups) - 1), model, ref)
+        return ref
+
+    if model == "10":
+        # (P1)K - (P2 - ... - Pn)K: P1 has own check; P2..last share a combined check
+        _validate_si_grouped_digits(content, 2, 3, ref, model)
+        groups = content.split("-")
+        _validate_checked_span(groups, 0, 0, model, ref)
+        _validate_checked_span(groups, 1, len(groups) - 1, model, ref)
         return ref
 
     raise UPNReferenceError(
-        f"unsupported SI reference model SI{model} (supported: SI00, SI07, SI12, SI99): {ref!r}"
+        f"unsupported SI reference model SI{model} "
+        f"(supported: {', '.join('SI' + m for m in _ALL_SUPPORTED)}): {ref!r}"
     )
 
 
