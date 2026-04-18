@@ -16,6 +16,7 @@ Configuration via environment variables:
   MAX_ATTACHMENT_BYTES   size limit per attachment in bytes (default: 104857600 = 100 MB)
   EPC_TO_UPN_CITY        recipient city used when converting EPC → UPN (default: Ljubljana)
   MAX_PDF_PAGES          max PDF pages rendered per attachment (default: 10)
+  PDF_RENDER_DPI         DPI for PDF→image rendering (default: 200)
   PDF_RENDER_TIMEOUT_S   pdf2image/poppler render timeout seconds (default: 20)
   PDFINFO_TIMEOUT_S      pdfinfo timeout seconds when checking PDF encryption (default: 3)
   MAX_IMAGE_PIXELS       PIL image pixel limit / decompression bomb guard (default: 40000000)
@@ -71,6 +72,7 @@ log = logging.getLogger(__name__)
 
 DEFAULT_MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024  # 100 MB
 DEFAULT_MAX_PDF_PAGES = 10
+DEFAULT_PDF_RENDER_DPI = 200
 DEFAULT_PDF_RENDER_TIMEOUT_S = 20
 # Keep conservative to avoid PIL DecompressionBomb warnings/errors on malicious inputs.
 DEFAULT_MAX_IMAGE_PIXELS = 40_000_000
@@ -129,12 +131,17 @@ def load_config() -> tuple[str, str, list[str], list[str], list[str], int]:
 
 
 def _decode_qr_bytes(data: bytes) -> str:
-    """Decode QR payload bytes. UPN spec mandates ISO 8859-2 (ECI 000004);
-    fall back to UTF-8 for non-UPN codes."""
+    """Decode QR payload bytes. Try UTF-8 first (strict); fall back to ISO 8859-2.
+
+    The UPN spec mandates ISO 8859-2 (ECI 000004), but many modern generators
+    emit UTF-8 without an ECI marker. Since valid UTF-8 multi-byte sequences
+    are not valid ISO 8859-2 text for the same characters, trying UTF-8 first
+    avoids misinterpreting Slovenian/Croatian diacritics.
+    """
     try:
-        return data.decode("iso-8859-2")
+        return data.decode("utf-8")
     except (UnicodeDecodeError, LookupError):
-        return data.decode("utf-8", errors="replace")
+        return data.decode("iso-8859-2", errors="replace")
 
 
 def scan_image_for_qr(img: Image.Image) -> list[str]:
@@ -147,14 +154,15 @@ def scan_image_for_qr(img: Image.Image) -> list[str]:
 
 
 def scan_pdf_for_qr(data: bytes) -> list[tuple[str, int]]:
-    """Render each PDF page at 150 DPI and scan for QR codes."""
+    """Render each PDF page and scan for QR codes."""
     codes: list[tuple[str, int]] = []
     try:
         max_pages = int(os.environ.get("MAX_PDF_PAGES", DEFAULT_MAX_PDF_PAGES))
+        dpi = int(os.environ.get("PDF_RENDER_DPI", DEFAULT_PDF_RENDER_DPI))
         timeout_s = int(os.environ.get("PDF_RENDER_TIMEOUT_S", DEFAULT_PDF_RENDER_TIMEOUT_S))
         pages = pdf2image.convert_from_bytes(
             data,
-            dpi=150,
+            dpi=dpi,
             first_page=1,
             last_page=max_pages,
             timeout=timeout_s,
@@ -381,7 +389,7 @@ def find_payments(qr_results: list[tuple[str, list[str]]]) -> list[PaymentItem]:
                 )
             )
         except EPCParseError:
-            log.debug("QR in %r is neither UPN nor EPC", source)
+            log.debug("QR in %r is neither UPN nor EPC", sources[0] if sources else "<unknown>")
 
     return payments
 

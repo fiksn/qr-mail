@@ -24,7 +24,7 @@ let
   # Shell wrapper that sets env vars and invokes the Python script.
   # pdf2image calls pdftoppm at runtime, so poppler_utils must be on PATH.
   processorBin = pkgs.writeShellScriptBin "qr-mail-processor" ''
-    export PATH="${pkgs.poppler_utils}/bin:$PATH"
+    export PATH="/run/wrappers/bin:${pkgs.poppler-utils}/bin:$PATH"
     export ADMIN_EMAIL=${lib.escapeShellArg cfg.adminEmail}
     export MY_ADDRESS=${lib.escapeShellArg cfg.myAddress}
     export ALLOWED_SENDERS=${lib.escapeShellArg (lib.concatStringsSep ":" cfg.allowedSenders)}
@@ -33,6 +33,7 @@ let
     export MAX_ATTACHMENT_BYTES=${toString cfg.maxAttachmentBytes}
     export EPC_TO_UPN_CITY=${lib.escapeShellArg cfg.epcToUpnCity}
     export MAX_PDF_PAGES=${toString cfg.maxPdfPages}
+    export PDF_RENDER_DPI=${toString cfg.pdfRenderDpi}
     export PDF_RENDER_TIMEOUT_S=${toString cfg.pdfRenderTimeoutSeconds}
     export PDFINFO_TIMEOUT_S=${toString cfg.pdfinfoTimeoutSeconds}
     export MAX_IMAGE_PIXELS=${toString cfg.maxImagePixels}
@@ -111,6 +112,12 @@ in
       description = "Maximum number of PDF pages to render and scan per attachment.";
     };
 
+    pdfRenderDpi = lib.mkOption {
+      type = lib.types.int;
+      default = 200;
+      description = "DPI for PDF→image rendering. 150 misses small QR codes; 200 is the minimum for reliable detection.";
+    };
+
     pdfRenderTimeoutSeconds = lib.mkOption {
       type = lib.types.int;
       default = 20;
@@ -135,6 +142,20 @@ in
       description = "Maximum total processing time in seconds per message (scan+parse+build).";
     };
 
+    catchAllWorkaround = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Enable when the mailserver uses a catch-all rule that intercepts
+        <option>myAddress</option> before Postfix transport rules can match it.
+
+        When true, adds an alias mapping <option>myAddress</option> to a
+        local-only address (<literal>qr-mail-pipe@localhost</literal>) and
+        routes that address to the pipe instead. The alias is processed before
+        catch-all rules, so the pipe receives the mail correctly.
+      '';
+    };
+
     epcToUpnCity = lib.mkOption {
       type = lib.types.str;
       default = "Ljubljana";
@@ -153,9 +174,9 @@ in
     };
     users.groups.qr-mail = {};
 
-    services.postfix.masterConfig."qr-mail" = {
+    services.postfix.settings.master."qr-mail" = {
       type = "unix";
-      privileged = false;
+      privileged = true;
       chroot = false;
       command = "pipe";
       args = [
@@ -165,8 +186,13 @@ in
       ];
     };
 
-    services.postfix.transport = ''
-      ${cfg.myAddress}  qr-mail:
+    services.postfix.extraAliases = lib.mkIf cfg.catchAllWorkaround ''
+      ${cfg.myAddress}: qr-mail-pipe@localhost
     '';
+
+    services.postfix.transport =
+      if cfg.catchAllWorkaround
+      then "qr-mail-pipe@localhost  qr-mail:\n"
+      else "${cfg.myAddress}  qr-mail:\n";
   };
 }
