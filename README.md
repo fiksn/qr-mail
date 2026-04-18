@@ -1,11 +1,11 @@
 # QR-mail
 
-Simple tool that parses incoming mail for UPC QR codes and converts them to EPC QR format.
+Simple tool that parses incoming mail for (Slovenian) UPN QR codes and converts them to EPC QR format.
 It is meant to be used with [https://gitlab.com/simple-nixos-mailserver/nixos-mailserver](https://gitlab.com/simple-nixos-mailserver/nixos-mailserver).
 For trusted users a reply is sent back. `allowedSenders` will be processed, but never replied to - that
 reply goes to `adminEmail`.
 
-Add this to `flake.nix` inputs like this:
+Add this to `flake.nix` inputs like:
 ```
 inputs = {
     qr-mail.url = "github:fiksn/qr-mail";
@@ -24,3 +24,7 @@ services.qrMail = {
    catchAllWorkaround = true;
 };
 ```
+
+## Other uses
+
+You can still use the python tooling independently of Nix. To convert or craft payment QR codes.
