@@ -25,6 +25,7 @@
               ps.google-auth # service account credentials
             ]))
             pkgs.poppler-utils # pdfinfo + pdftoppm (runtime dep of pdf2image)
+            pkgs.git # git
           ];
         };
       });

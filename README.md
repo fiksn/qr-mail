@@ -1,9 +1,30 @@
 # QR-mail
 
 Simple tool that parses incoming mail for (Slovenian) UPN QR codes and converts them to EPC QR format.
-It is meant to be used with [https://gitlab.com/simple-nixos-mailserver/nixos-mailserver](https://gitlab.com/simple-nixos-mailserver/nixos-mailserver).
+It is meant to be used with [https://gitlab.com/simple-nixos-mailserver/nixos-mailserver](https://gitlab.com/simple-nixos-mailserver/nixos-mailserver) or
+Google Workspace (but you still need a server to process and reply to emails periodically).
+
 For trusted users a reply is sent back. `allowedSenders` will be processed, but never replied to - that
 reply goes to `adminEmail`.
+
+## Idea
+
+You get invoices via email in form of PDFs or images. However if you are Slovene the QR codes are UPNs (which stands for
+Univerzalni Placilni Nalog). You can scan them with your banking app to pay, however with Revolut or N26 it won't work as they don't understand this format.
+The idea of this tool is that you just forward such emails (possibly automatically based on sender email) to special qr@domain.tld address that you set-up.
+
+Then you (`adminEmail`) get a mail that is basically a forward of the original email but has QR codes extracted and replaced with EPC QR codes which
+work with international banking apps. So for you the flow is exactly the same as before except that you only get an invoice with FIXED QR codes that you can
+directly scan. Whether you want to keep the original mail or not is entirely up to you and how you set-up email forwarding.
+
+First I wanted to use [UPN-EPC-QR.SI](https://upn-epc-qr.si) which works by scanning QR codes from the browser (on your phone). It works great however it is
+a bit invasive to your privacy as the author sees everything. It is also an additional manual step that is cumbersome. If you already have a mail server (even
+if it is not Nix based this tool is great).
+
+I also puzzled with the idea of mobile app that would invoke Revolut or N26 with a special `intent` to prefill payment details but unfortunately due to
+security reasons this is not really possible.
+
+## Usage
 
 Add this to `flake.nix` inputs like:
 ```
@@ -27,7 +48,7 @@ services.qrMail = {
 
 ## Other uses
 
-You can still use the python tooling independently of Nix. To convert or craft payment QR codes.
+You can still use the python tooling independently of Nix, for instance to convert or craft payment QR codes.
 
 ## Google Workspace Fetching
 
