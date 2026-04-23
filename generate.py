@@ -15,6 +15,8 @@ import io
 from epc import EPC, CHARSETS
 from upn import UPN, UPNReferenceError, validate_upn_reference
 
+DEFAULT_EPC_BENEFICIARY_NAME = "PREJEMNIK"
+
 
 # ── Serialisers ────────────────────────────────────────────────────────────────
 
@@ -68,6 +70,8 @@ def epc_to_string(epc: EPC) -> str:
         epc.unstructured_ref,
         epc.originator_info,
     ]
+    while fields and fields[-1] == "":
+        fields.pop()
     return "\n".join(fields)
 
 
@@ -141,16 +145,18 @@ def upn_to_epc(upn: UPN) -> EPC:
 
     unstructured_ref = " / ".join(unstructured_parts)[:140]
 
-    if len(upn.recipient_name) > 70:
+    beneficiary_name = (upn.recipient_name or "").strip() or DEFAULT_EPC_BENEFICIARY_NAME
+
+    if len(beneficiary_name) > 70:
         raise ValueError(
-            f"recipient name too long for EPC (max 70 chars): {upn.recipient_name!r}"
+            f"recipient name too long for EPC (max 70 chars): {beneficiary_name!r}"
         )
 
     return EPC(
         version="002",
         charset="utf-8",
         bic="",
-        beneficiary_name=upn.recipient_name,
+        beneficiary_name=beneficiary_name,
         beneficiary_iban=upn.recipient_iban,
         amount=upn.amount if upn.amount_cents else None,
         purpose_code=upn.purpose_code,

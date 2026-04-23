@@ -59,6 +59,7 @@ from PIL import Image
 from pyzbar import pyzbar
 
 from epc import EPC, EPCParseError, format_epc, parse_epc
+from eslog import ESlogParseError, parse_eslog_invoice
 from generate import epc_to_string, generate_epc_qr, upn_to_epc
 from generate_qr import generate_upn_slip_png
 from text_extract import (
@@ -444,11 +445,41 @@ def _payment_dedup_key(payment: PaymentItem) -> Optional[tuple[str, str]]:
     return None
 
 
+def _merge_payments_with_precedence(
+    text_upns: list[tuple[UPN, str]],
+    eslog_upns: list[tuple[UPN, str]],
+    qr_payments: list[PaymentItem],
+) -> list[PaymentItem]:
+    """Merge payments by key with precedence: text < eSLOG XML < QR."""
+    merged: dict[tuple[str, str], tuple[int, PaymentItem]] = {}
+    extras: list[PaymentItem] = []
+
+    def add(payment: PaymentItem, rank: int) -> None:
+        key = _payment_dedup_key(payment)
+        if key is None:
+            extras.append(payment)
+            return
+        existing = merged.get(key)
+        if existing is None or rank >= existing[0]:
+            merged[key] = (rank, payment)
+
+    for upn, source in text_upns:
+        add(_build_upn_payment(upn, sources=[source], note_prefix="Text-extracted"), rank=1)
+
+    for upn, source in eslog_upns:
+        add(_build_upn_payment(upn, sources=[source], note_prefix="eSLOG XML"), rank=2)
+
+    for payment in qr_payments:
+        add(payment, rank=3)
+
+    return extras + [payment for _, payment in merged.values()]
+
+
 def scan_text_for_payments(
     msg: email.message.Message,
     max_bytes: int,
 ) -> list[tuple[UPN, str]]:
-    """Extract IBAN+reference pairs from email body, PDF text, and image OCR.
+    """Extract UPN candidates from body text, PDF text, and image OCR.
 
     Returns (upn, source_label) tuples, deduplicated by (iban, reference).
     """
@@ -496,6 +527,46 @@ def scan_text_for_payments(
         seen.add(key)
         upn = build_upn_from_text(iban, ref, recipient_city=recipient_city)
         results.append((upn, source))
+
+    return results
+
+
+def scan_eslog_xml_for_payments(
+    msg: email.message.Message,
+    max_bytes: int,
+) -> list[tuple[UPN, str]]:
+    """Extract UPN candidates from supported eSLOG XML attachments."""
+    results: list[tuple[UPN, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    for part in msg.walk():
+        content_type = part.get_content_type()
+        filename = part.get_filename() or f"<{content_type}>"
+        is_xml = (
+            content_type in ("application/xml", "text/xml")
+            or filename.lower().endswith(".xml")
+        )
+        if not is_xml:
+            continue
+
+        payload = part.get_payload(decode=True)
+        if payload is None or len(payload) > max_bytes:
+            continue
+
+        try:
+            upn = parse_eslog_invoice(payload)
+        except ESlogParseError:
+            log.debug("XML attachment %r is not a supported eSLOG invoice", filename)
+            continue
+        except Exception as exc:
+            log.warning("Failed to parse XML attachment %r: %s", filename, exc)
+            continue
+
+        key = (upn.recipient_iban, upn.recipient_reference)
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append((upn, f"{filename} (eSLOG XML)"))
 
     return results
 
@@ -824,34 +895,21 @@ def main() -> None:
         signal.signal(signal.SIGALRM, _alarm_handler)
         signal.alarm(runtime_s)
     try:
+        text_upns = scan_text_for_payments(msg, max_bytes)
+        log.info("Text-extracted payment candidates: %d", len(text_upns))
+
+        eslog_upns = scan_eslog_xml_for_payments(msg, max_bytes)
+        log.info("eSLOG XML payment candidates: %d", len(eslog_upns))
+
         qr_results = scan_attachments(msg, max_bytes)
         log.info("QR codes found (raw): %d", len(qr_results))
         qr_unique = dedupe_qr_results(qr_results)
         log.info("QR codes found (unique): %d", len(qr_unique))
+        qr_payments = find_payments(qr_unique)
+        log.info("Payment QR items: %d", len(qr_payments))
 
-        payments = find_payments(qr_unique)
-        log.info("Payment QR items: %d", len(payments))
-
-        # Text extraction: find IBAN + reference in email body, PDFs, images.
-        text_upns = scan_text_for_payments(msg, max_bytes)
-        if text_upns:
-            seen_keys: set[tuple[str, str]] = set()
-            for p in payments:
-                key = _payment_dedup_key(p)
-                if key is not None:
-                    seen_keys.add(key)
-            added = 0
-            for upn, source in text_upns:
-                key = (upn.recipient_iban, upn.recipient_reference)
-                if key in seen_keys:
-                    log.debug("Skipping text-extracted %s (already found via QR)", key)
-                    continue
-                seen_keys.add(key)
-                payments.append(_build_upn_payment(
-                    upn, sources=[source], note_prefix="Text-extracted",
-                ))
-                added += 1
-            log.info("Text-extracted payment items: %d (from %d candidates)", added, len(text_upns))
+        payments = _merge_payments_with_precedence(text_upns, eslog_upns, qr_payments)
+        log.info("Merged payment items: %d", len(payments))
     except MessageProcessingTimeout as exc:
         log.warning("Message processing timed out: %s", exc)
         extra_warnings.append(f"Processing timed out after {runtime_s}s; results may be incomplete.")

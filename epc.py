@@ -123,11 +123,9 @@ def parse_epc(text: str) -> EPC:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     fields = text.split("\n")
 
-    # Allow trailing empty fields (some generators append a final newline)
+    # Canonical EPC payloads may omit trailing empty optional fields.
     if len(fields) < FIELD_COUNT:
-        raise EPCParseError(
-            f"too few fields: need {FIELD_COUNT}, got {len(fields)}"
-        )
+        fields.extend([""] * (FIELD_COUNT - len(fields)))
 
     if fields[0] != SERVICE_TAG:
         raise EPCParseError(f"service tag must be 'BCD', got {fields[0]!r}")

@@ -14,13 +14,72 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
 
-from generate import generate_epc_qr, generate_upn_qr, upn_to_epc
+from generate import (
+    epc_to_string,
+    generate_epc_qr,
+    generate_upn_qr,
+    upn_to_epc,
+    upn_to_string,
+)
 from upn import UPN, UPNReferenceError, validate_upn_reference
 
 DEFAULT_SLIP_TEMPLATE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "upn_base_empty.jpg",
 )
+
+
+def _render_qr_ascii(
+    payload: str,
+    *,
+    encoding: str,
+    error: str = "m",
+    version: Optional[int] = None,
+    border: int = 1,
+) -> str:
+    import segno
+
+    qr = segno.make_qr(payload, encoding=encoding, error=error, version=version)
+    rows = [list(row) for row in qr.matrix]
+    width = len(rows[0]) if rows else 0
+    quiet_row = [False] * (width + 2 * border)
+    lines: list[str] = []
+
+    def pair_to_char(top: bool, bottom: bool) -> str:
+        if top and bottom:
+            return "█"
+        if top:
+            return "▀"
+        if bottom:
+            return "▄"
+        return " "
+
+    white_bg = "\x1b[47m"
+    black_fg = "\x1b[30m"
+    reset = "\x1b[0m"
+
+    padded_rows = [quiet_row[:] for _ in range(border)]
+    padded_rows.extend((([False] * border) + row + ([False] * border)) for row in rows)
+    padded_rows.extend([quiet_row[:] for _ in range(border)])
+
+    if len(padded_rows) % 2:
+        padded_rows.append([False] * len(quiet_row))
+
+    for i in range(0, len(padded_rows), 2):
+        top = padded_rows[i]
+        bottom = padded_rows[i + 1]
+        line = "".join(pair_to_char(a, b) for a, b in zip(top, bottom))
+        lines.append(f"{white_bg}{black_fg}{line}{reset}")
+    return "\n".join(lines)
+
+
+def render_upn_qr_ascii(upn: UPN) -> str:
+    return _render_qr_ascii(upn_to_string(upn), encoding="iso-8859-2", error="m", version=15)
+
+
+def render_epc_qr_ascii(upn: UPN) -> str:
+    epc = upn_to_epc(upn)
+    return _render_qr_ascii(epc_to_string(epc), encoding="utf-8", error="m")
 
 
 def ask(prompt: str, *, default: str = "", required: bool = False) -> str:
@@ -152,7 +211,7 @@ def _load_font(size: int, *, bold: bool = False) -> Any:
 
 
 def _format_eur_for_slip(amount_cents: int) -> str:
-    if amount_cents <= 0:
+    if amount_cents < 0:
         return "***"
     eur = f"{amount_cents / 100:.2f}".replace(".", ",")
     return f"***{eur}"
@@ -273,7 +332,7 @@ def _draw_amount_boxed(
     font: Any,
     fill: str = "#202020",
 ) -> None:
-    if amount_cents <= 0:
+    if amount_cents < 0:
         return
     digits = f"{amount_cents:d}"
     x1, y1, x2, y2 = box
@@ -434,9 +493,9 @@ def main() -> None:
                         help="filename prefix for saved PNGs (default: payment)")
     parser.add_argument(
         "--format",
-        choices=["upn", "epc", "both", "slip", "poloznica", "all"],
+        choices=["upn", "epc", "both", "slip", "poloznica", "all", "upn_cli", "epc_cli"],
         default="both",
-        help="output mode: upn, epc, both, slip/poloznica, all (default: both)",
+        help="output mode: upn, epc, both, slip/poloznica, all, upn_cli, epc_cli (default: both)",
     )
     parser.add_argument(
         "--slip-template",
@@ -484,6 +543,8 @@ def main() -> None:
     want_upn = args.format in ("upn", "both", "all")
     want_epc = args.format in ("epc", "both", "all")
     want_slip = args.format in ("slip", "poloznica", "all")
+    want_upn_cli = args.format == "upn_cli"
+    want_epc_cli = args.format == "epc_cli"
 
     prefix = args.output
 
@@ -493,16 +554,24 @@ def main() -> None:
             f.write(generate_upn_qr(upn))
         print(f"UPN QR saved: {upn_path}")
 
-    if want_epc:
+    if want_upn_cli:
+        print("UPN QR (ASCII):")
+        print(render_upn_qr_ascii(upn))
+
+    if want_epc or want_epc_cli:
         try:
             epc = upn_to_epc(upn)
         except Exception as exc:
             print(f"EPC conversion failed: {exc}", file=sys.stderr)
             sys.exit(1)
-        epc_path = f"{prefix}_epc.png"
-        with open(epc_path, "wb") as f:
-            f.write(generate_epc_qr(epc))
-        print(f"EPC QR saved: {epc_path}")
+        if want_epc:
+            epc_path = f"{prefix}_epc.png"
+            with open(epc_path, "wb") as f:
+                f.write(generate_epc_qr(epc))
+            print(f"EPC QR saved: {epc_path}")
+        if want_epc_cli:
+            print("EPC QR (ASCII):")
+            print(_render_qr_ascii(epc_to_string(epc), encoding="utf-8", error="m"))
 
     if want_slip:
         try:

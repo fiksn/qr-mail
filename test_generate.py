@@ -5,7 +5,14 @@ from upn import UPN
 
 
 class TestUPNToEPC(unittest.TestCase):
-    def _upn(self, *, recipient_reference: str, payment_purpose: str = "PURPOSE") -> UPN:
+    def _upn(
+        self,
+        *,
+        recipient_reference: str,
+        payment_purpose: str = "PURPOSE",
+        recipient_name: str = "ACME",
+        amount_cents: int = 123,
+    ) -> UPN:
         return UPN(
             payer_iban="",
             deposit=False,
@@ -14,7 +21,7 @@ class TestUPNToEPC(unittest.TestCase):
             payer_name="",
             payer_street="",
             payer_city="",
-            amount_cents=123,
+            amount_cents=amount_cents,
             payment_date=None,
             urgent=False,
             purpose_code="",
@@ -22,7 +29,7 @@ class TestUPNToEPC(unittest.TestCase):
             payment_deadline=None,
             recipient_iban="SI56192001234567892",
             recipient_reference=recipient_reference,
-            recipient_name="ACME",
+            recipient_name=recipient_name,
             recipient_street="",
             recipient_city="Ljubljana",
         )
@@ -38,7 +45,18 @@ class TestUPNToEPC(unittest.TestCase):
         self.assertEqual(epc.unstructured_ref, "")
         self.assertEqual(epc.originator_info, "hello")
 
+    def test_missing_recipient_name_uses_default_for_epc(self) -> None:
+        epc = upn_to_epc(
+            self._upn(
+                recipient_reference="SI001234",
+                payment_purpose="",
+                recipient_name="",
+                amount_cents=0,
+            )
+        )
+        self.assertEqual(epc.beneficiary_name, "PREJEMNIK")
+        self.assertIsNone(epc.amount)
+
 
 if __name__ == "__main__":
     unittest.main()
-

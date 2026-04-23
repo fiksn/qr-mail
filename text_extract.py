@@ -25,7 +25,7 @@ from upn import UPN, UPNReferenceError, validate_upn_reference
 log = logging.getLogger(__name__)
 
 # Lines above/below an IBAN to search for a matching reference.
-PROXIMITY_WINDOW = 6
+PROXIMITY_WINDOW = 10
 
 # Regex for Slovenian IBANs: SI + 2 check digits + 15 digits, with
 # optional spaces/separators between groups of 4.

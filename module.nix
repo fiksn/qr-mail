@@ -20,6 +20,7 @@ let
     cp ${./mail_processor.py} $out/mail_processor.py
     cp ${./upn.py}            $out/upn.py
     cp ${./epc.py}            $out/epc.py
+    cp ${./eslog.py}          $out/eslog.py
     cp ${./generate.py}       $out/generate.py
     cp ${./generate_qr.py}    $out/generate_qr.py
     cp ${./text_extract.py}   $out/text_extract.py
