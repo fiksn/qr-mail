@@ -19,12 +19,14 @@
               ps.pillow # image loading / generation
               ps.pyzbar # QR code detection
               ps.pdf2image # PDF → image via poppler
+              ps.pytesseract # OCR via tesseract
               ps.segno # QR code generation
               ps.pytest # test runner
               ps.google-api-python-client # Gmail API
               ps.google-auth # service account credentials
             ]))
-            pkgs.poppler-utils # pdfinfo + pdftoppm (runtime dep of pdf2image)
+            pkgs.poppler-utils # pdfinfo + pdftoppm + pdftotext (runtime dep of pdf2image)
+            pkgs.tesseract # OCR engine for text extraction from images
             pkgs.git # git
           ];
         };

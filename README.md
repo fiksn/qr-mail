@@ -10,7 +10,7 @@ reply goes to `adminEmail`.
 ## Idea
 
 You get invoices via email in form of PDFs or images. However if you are Slovene the QR codes are UPNs (which stands for
-Univerzalni Placilni Nalog). You can scan them with your banking app to pay, however with Revolut or N26 it won't work as they don't understand this format.
+Univerzalni Placilni Nalog). You can scan them with your banking app to pay, however with Revolut it won't work as they don't understand this format.
 The idea of this tool is that you just forward such emails (possibly automatically based on sender email) to special qr@domain.tld address that you set-up.
 
 Then you (`adminEmail`) get a mail that is basically a forward of the original email but has QR codes extracted and replaced with EPC QR codes which
@@ -21,7 +21,7 @@ First I wanted to use [UPN-EPC-QR.SI](https://upn-epc-qr.si) which works by scan
 a bit invasive to your privacy as the author sees everything. It is also an additional manual step that is cumbersome. If you already have a mail server (even
 if it is not Nix based this tool is great).
 
-I also puzzled with the idea of mobile app that would invoke Revolut or N26 with a special `intent` to prefill payment details but unfortunately due to
+I also puzzled with the idea of mobile app that would invoke Revolut with a special `intent` to prefill payment details but unfortunately due to
 security reasons this is not really possible.
 
 ## Usage
@@ -49,6 +49,17 @@ services.qrMail = {
 ## Other uses
 
 You can still use the python tooling independently of Nix, for instance to convert or craft payment QR codes.
+
+Example:
+```bash
+python3 generate_qr.py --format both        # UPN + EPC QR PNGs
+python3 generate_qr.py --format slip        # full UPN poloznica PNG (pink form + QR)
+python3 generate_qr.py --format all         # UPN + EPC + poloznica
+python3 generate_qr.py --format slip --slip-template ./UPN-1.jpg
+```
+
+Note: `--format slip` / `--format all` needs Pillow (`pip install pillow`).
+Default slip template path is `./upn_base_empty.jpg` (bundled in repo).
 
 ## Google Workspace Fetching
 

@@ -60,6 +60,13 @@ from pyzbar import pyzbar
 
 from epc import EPC, EPCParseError, format_epc, parse_epc
 from generate import epc_to_string, generate_epc_qr, upn_to_epc
+from generate_qr import generate_upn_slip_png
+from text_extract import (
+    build_upn_from_text,
+    extract_image_text_from_bytes,
+    extract_pdf_text,
+    find_iban_reference_pairs,
+)
 from routing import (
     find_route,
     is_allowed_sender,
@@ -113,6 +120,7 @@ class PaymentItem:
 
     epc_qr_png: Optional[bytes] = None
     epc_payload: Optional[str] = None
+    upn_slip_png: Optional[bytes] = None
 
     conversion_error: Optional[str] = None
     reference_errors: list[str] = field(default_factory=list)
@@ -318,6 +326,64 @@ def dedupe_qr_results(qr_results: list[tuple[str, str]]) -> list[tuple[str, list
     return [seen[k] for k in order]
 
 
+def _build_upn_payment(
+    upn: UPN,
+    *,
+    sources: list[str],
+    note_prefix: str = "UPN QR",
+) -> PaymentItem:
+    """Build a PaymentItem from a parsed UPN: validate refs, generate EPC QR + slip."""
+    source_label = sources[0] if sources else "<unknown>"
+    ref_errors: list[str] = []
+    if upn.payer_reference:
+        try:
+            validate_upn_reference(upn.payer_reference)
+        except UPNReferenceError as exc:
+            ref_errors.append(f"payer reference: {exc}")
+    if upn.recipient_reference:
+        try:
+            validate_upn_reference(upn.recipient_reference)
+        except UPNReferenceError as exc:
+            ref_errors.append(f"recipient reference: {exc}")
+
+    slip_png: Optional[bytes] = None
+    try:
+        slip_png = generate_upn_slip_png(upn)
+    except Exception as exc:
+        log.warning("UPN slip generation failed for %r: %s", source_label, exc)
+
+    try:
+        epc = upn_to_epc(upn)
+        payload = epc_to_string(epc)
+        png = generate_epc_qr(epc)
+        return PaymentItem(
+            sources=sources,
+            kind="upn",
+            note=f"{note_prefix} (converted to EPC SCT)",
+            upn=upn,
+            epc=epc,
+            epc_qr_png=png,
+            epc_payload=payload,
+            upn_slip_png=slip_png,
+            conversion_error=None,
+            reference_errors=ref_errors,
+        )
+    except Exception as exc:
+        log.warning("UPN→EPC conversion failed for %r: %s", source_label, exc)
+        return PaymentItem(
+            sources=sources,
+            kind="upn",
+            note=f"{note_prefix} (conversion to EPC SCT failed)",
+            upn=upn,
+            epc=None,
+            epc_qr_png=None,
+            epc_payload=None,
+            upn_slip_png=slip_png,
+            conversion_error=str(exc),
+            reference_errors=ref_errors,
+        )
+
+
 def find_payments(qr_results: list[tuple[str, list[str]]]) -> list[PaymentItem]:
     """Parse QR codes and return a list of UPN (converted) and EPC (direct) items."""
     payments: list[PaymentItem] = []
@@ -326,50 +392,7 @@ def find_payments(qr_results: list[tuple[str, list[str]]]) -> list[PaymentItem]:
         try:
             upn = parse_upn(qr_text)
             log.info("UPN found in %r:\n%s", sources[0] if sources else "<unknown>", format_upn(upn))
-            ref_errors: list[str] = []
-            if upn.payer_reference:
-                try:
-                    validate_upn_reference(upn.payer_reference)
-                except UPNReferenceError as exc:
-                    ref_errors.append(f"payer reference: {exc}")
-            if upn.recipient_reference:
-                try:
-                    validate_upn_reference(upn.recipient_reference)
-                except UPNReferenceError as exc:
-                    ref_errors.append(f"recipient reference: {exc}")
-            try:
-                epc = upn_to_epc(upn)
-                payload = epc_to_string(epc)
-                png = generate_epc_qr(epc)
-                payments.append(
-                    PaymentItem(
-                        sources=sources,
-                        kind="upn",
-                        note="UPN QR (converted to EPC SCT)",
-                        upn=upn,
-                        epc=epc,
-                        epc_qr_png=png,
-                        epc_payload=payload,
-                        conversion_error=None,
-                        reference_errors=ref_errors,
-                    )
-                )
-            except Exception as exc:
-                log.warning("UPN→EPC conversion failed for QR in %r: %s", sources[0] if sources else "<unknown>", exc)
-                # Still include the parsed UPN in the forwarded mail, but without EPC QR.
-                payments.append(
-                    PaymentItem(
-                        sources=sources,
-                        kind="upn",
-                        note="UPN QR (conversion to EPC SCT failed)",
-                        upn=upn,
-                        epc=None,
-                        epc_qr_png=None,
-                        epc_payload=None,
-                        conversion_error=str(exc),
-                        reference_errors=ref_errors,
-                    )
-                )
+            payments.append(_build_upn_payment(upn, sources=sources))
             continue
         except UPNParseError:
             pass
@@ -406,6 +429,75 @@ def find_payments(qr_results: list[tuple[str, list[str]]]) -> list[PaymentItem]:
             log.debug("QR in %r is neither UPN nor EPC", sources[0] if sources else "<unknown>")
 
     return payments
+
+
+def _payment_dedup_key(payment: PaymentItem) -> Optional[tuple[str, str]]:
+    """Return (iban, reference) key for deduplication, or None."""
+    if payment.upn is not None:
+        iban = payment.upn.recipient_iban.strip().upper()
+        ref = payment.upn.recipient_reference.strip().upper().replace(" ", "")
+        return (iban, ref)
+    if payment.epc is not None:
+        iban = payment.epc.beneficiary_iban.strip().upper()
+        ref = (payment.epc.structured_ref or "").strip().upper().replace(" ", "")
+        return (iban, ref)
+    return None
+
+
+def scan_text_for_payments(
+    msg: email.message.Message,
+    max_bytes: int,
+) -> list[tuple[UPN, str]]:
+    """Extract IBAN+reference pairs from email body, PDF text, and image OCR.
+
+    Returns (upn, source_label) tuples, deduplicated by (iban, reference).
+    """
+    recipient_city = os.environ.get("EPC_TO_UPN_CITY", "Ljubljana")
+    all_pairs: list[tuple[str, str, str]] = []  # (iban, ref, source)
+
+    # 1. Email body text.
+    body_text = extract_text_body(msg)
+    for iban, ref in find_iban_reference_pairs(body_text):
+        all_pairs.append((iban, ref, "email-body"))
+
+    # 2. Attachment text (PDFs and images).
+    for part in msg.walk():
+        content_type = part.get_content_type()
+        filename = part.get_filename() or f"<{content_type}>"
+
+        is_image = content_type.startswith("image/")
+        is_pdf = content_type == "application/pdf" or filename.lower().endswith(".pdf")
+        if not (is_image or is_pdf):
+            continue
+
+        payload = part.get_payload(decode=True)
+        if payload is None or len(payload) > max_bytes:
+            continue
+
+        if is_pdf:
+            text = extract_pdf_text(payload)
+            if text.strip():
+                for iban, ref in find_iban_reference_pairs(text):
+                    all_pairs.append((iban, ref, f"{filename} (text)"))
+
+        if is_image:
+            text = extract_image_text_from_bytes(payload)
+            if text.strip():
+                for iban, ref in find_iban_reference_pairs(text):
+                    all_pairs.append((iban, ref, f"{filename} (OCR)"))
+
+    # Deduplicate within text-extracted results.
+    seen: set[tuple[str, str]] = set()
+    results: list[tuple[UPN, str]] = []
+    for iban, ref, source in all_pairs:
+        key = (iban, ref)
+        if key in seen:
+            continue
+        seen.add(key)
+        upn = build_upn_from_text(iban, ref, recipient_city=recipient_city)
+        results.append((upn, source))
+
+    return results
 
 
 def extract_text_body(msg: email.message.Message) -> str:
@@ -468,22 +560,40 @@ def _build_payment_text_block(payment: PaymentItem) -> list[str]:
         else:
             lines += ["", "  EPC QR: see inline preview (if supported) and attachment"]
 
+    if payment.upn_slip_png is not None:
+        lines += ["  UPN slip: see inline preview (if supported) and attachment"]
+    elif payment.kind == "upn":
+        lines += ["  UPN slip: NOT GENERATED"]
+
     return lines
 
 
-def _build_payment_html_block(payment: PaymentItem, *, cid: Optional[str]) -> str:
+def _build_payment_html_block(
+    payment: PaymentItem,
+    *,
+    cid: Optional[str],
+    slip_cid: Optional[str] = None,
+) -> str:
     """HTML payment block used in forwarded mail."""
     text_lines = _build_payment_text_block(payment)
     pre = "<pre>" + html.escape("\n".join(text_lines)) + "</pre>"
-    img = ""
+    epc_img = ""
     if cid and payment.epc_qr_png is not None:
-        img = (
+        epc_img = (
             f'<div style="margin: 8px 0 12px 0;">'
             f'<img alt="EPC QR" src="cid:{html.escape(cid)}" '
             f'style="max-width: 320px; width: 100%; height: auto; border: 1px solid #ccc;" />'
             f"</div>"
         )
-    return img + pre
+    slip_img = ""
+    if slip_cid and payment.upn_slip_png is not None:
+        slip_img = (
+            f'<div style="margin: 8px 0 12px 0;">'
+            f'<img alt="UPN payment slip" src="cid:{html.escape(slip_cid)}" '
+            f'style="max-width: 900px; width: 100%; height: auto; border: 1px solid #ccc;" />'
+            f"</div>"
+        )
+    return epc_img + slip_img + pre
 
 
 def build_forward(
@@ -561,9 +671,10 @@ def build_forward(
         html_parts.append("<h3>Payments</h3>")
         for i, payment in enumerate(payments, start=1):
             cid = f"payment_{i}_epc_qr"
+            slip_cid = f"payment_{i}_upn_slip" if payment.upn_slip_png is not None else None
             src = ", ".join(payment.sources) if payment.sources else "(unknown source)"
             html_parts.append(f"<h4>Payment {i} (found in: {html.escape(src)})</h4>")
-            html_parts.append(_build_payment_html_block(payment, cid=cid))
+            html_parts.append(_build_payment_html_block(payment, cid=cid, slip_cid=slip_cid))
 
     html_parts.append("<hr />")
     html_parts.append("<pre>")
@@ -584,25 +695,35 @@ def build_forward(
 
     # Inline images for HTML via CID.
     for i, payment in enumerate(payments, start=1):
-        if payment.epc_qr_png is None:
-            continue
-        img_part = MIMEImage(payment.epc_qr_png, _subtype="png")
-        img_part.add_header("Content-ID", f"<payment_{i}_epc_qr>")
-        img_part.add_header("Content-Disposition", "inline", filename=f"payment_{i}_epc_qr.png")
-        related.attach(img_part)
+        if payment.epc_qr_png is not None:
+            img_part = MIMEImage(payment.epc_qr_png, _subtype="png")
+            img_part.add_header("Content-ID", f"<payment_{i}_epc_qr>")
+            img_part.add_header("Content-Disposition", "inline", filename=f"payment_{i}_epc_qr.png")
+            related.attach(img_part)
+        if payment.upn_slip_png is not None:
+            slip_part = MIMEImage(payment.upn_slip_png, _subtype="png")
+            slip_part.add_header("Content-ID", f"<payment_{i}_upn_slip>")
+            slip_part.add_header("Content-Disposition", "inline", filename=f"payment_{i}_upn_slip.png")
+            related.attach(slip_part)
 
     fwd.attach(related)
 
-    # ── EPC QR attachments ────────────────────────────────────────────────────
+    # ── EPC QR and UPN slip attachments ──────────────────────────────────────
     for i, payment in enumerate(payments, start=1):
-        if payment.epc_qr_png is None:
-            continue
-        img_part = MIMEImage(payment.epc_qr_png, _subtype="png")
-        img_part.add_header(
-            "Content-Disposition", "attachment",
-            filename=f"payment_{i}_epc_qr.png",
-        )
-        fwd.attach(img_part)
+        if payment.epc_qr_png is not None:
+            img_part = MIMEImage(payment.epc_qr_png, _subtype="png")
+            img_part.add_header(
+                "Content-Disposition", "attachment",
+                filename=f"payment_{i}_epc_qr.png",
+            )
+            fwd.attach(img_part)
+        if payment.upn_slip_png is not None:
+            slip_part = MIMEImage(payment.upn_slip_png, _subtype="png")
+            slip_part.add_header(
+                "Content-Disposition", "attachment",
+                filename=f"payment_{i}_upn_slip.png",
+            )
+            fwd.attach(slip_part)
 
     # ── Original attachments (preserved) ─────────────────────────────────────
     for part in original.walk():
@@ -710,6 +831,27 @@ def main() -> None:
 
         payments = find_payments(qr_unique)
         log.info("Payment QR items: %d", len(payments))
+
+        # Text extraction: find IBAN + reference in email body, PDFs, images.
+        text_upns = scan_text_for_payments(msg, max_bytes)
+        if text_upns:
+            seen_keys: set[tuple[str, str]] = set()
+            for p in payments:
+                key = _payment_dedup_key(p)
+                if key is not None:
+                    seen_keys.add(key)
+            added = 0
+            for upn, source in text_upns:
+                key = (upn.recipient_iban, upn.recipient_reference)
+                if key in seen_keys:
+                    log.debug("Skipping text-extracted %s (already found via QR)", key)
+                    continue
+                seen_keys.add(key)
+                payments.append(_build_upn_payment(
+                    upn, sources=[source], note_prefix="Text-extracted",
+                ))
+                added += 1
+            log.info("Text-extracted payment items: %d (from %d candidates)", added, len(text_upns))
     except MessageProcessingTimeout as exc:
         log.warning("Message processing timed out: %s", exc)
         extra_warnings.append(f"Processing timed out after {runtime_s}s; results may be incomplete.")

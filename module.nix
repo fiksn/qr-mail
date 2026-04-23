@@ -7,6 +7,7 @@ let
     ps.pillow # image loading
     ps.pyzbar # QR code detection (wraps ZBar)
     ps.pdf2image # renders PDF pages via poppler
+    ps.pytesseract # OCR via tesseract
     ps.segno # QR code generation with ECI support
     ps.google-api-python-client # Gmail API (gmail_fetch.py)
     ps.google-auth # service account credentials
@@ -20,14 +21,17 @@ let
     cp ${./upn.py}            $out/upn.py
     cp ${./epc.py}            $out/epc.py
     cp ${./generate.py}       $out/generate.py
+    cp ${./generate_qr.py}    $out/generate_qr.py
+    cp ${./text_extract.py}   $out/text_extract.py
     cp ${./routing.py}        $out/routing.py
     cp ${./gmail_fetch.py}    $out/gmail_fetch.py
+    cp ${./upn_base_empty.jpg} $out/upn_base_empty.jpg
   '';
 
   # Shell wrapper that sets env vars and invokes the Python script.
   # pdf2image calls pdftoppm at runtime, so poppler_utils must be on PATH.
   processorBin = pkgs.writeShellScriptBin "qr-mail-processor" ''
-    export PATH="/run/wrappers/bin:${pkgs.poppler-utils}/bin:$PATH"
+    export PATH="/run/wrappers/bin:${pkgs.poppler-utils}/bin:${pkgs.tesseract}/bin:$PATH"
     export ADMIN_EMAIL=${lib.escapeShellArg cfg.adminEmail}
     export MY_ADDRESS=${lib.escapeShellArg cfg.myAddress}
     export ALLOWED_SENDERS=${lib.escapeShellArg (lib.concatStringsSep ":" cfg.allowedSenders)}
