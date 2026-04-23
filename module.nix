@@ -13,19 +13,12 @@ let
     ps.google-auth # service account credentials
   ]);
 
-  # Bundle all Python source files into one store path so imports resolve
-  # correctly (Python adds the script directory to sys.path automatically).
+  # Bundle the Python packages and scripts into one store path.
   src = pkgs.runCommandLocal "qr-mail-src" { } ''
-    mkdir $out
-    cp ${./mail_processor.py} $out/mail_processor.py
-    cp ${./upn.py}            $out/upn.py
-    cp ${./epc.py}            $out/epc.py
-    cp ${./eslog.py}          $out/eslog.py
-    cp ${./generate.py}       $out/generate.py
-    cp ${./generate_qr.py}    $out/generate_qr.py
-    cp ${./text_extract.py}   $out/text_extract.py
-    cp ${./routing.py}        $out/routing.py
-    cp ${./gmail_fetch.py}    $out/gmail_fetch.py
+    mkdir -p $out
+    cp -r ${./core} $out/core
+    cp -r ${./parsers} $out/parsers
+    cp -r ${./scripts} $out/scripts
     cp ${./upn_base_empty.jpg} $out/upn_base_empty.jpg
   '';
 
@@ -33,6 +26,7 @@ let
   # pdf2image calls pdftoppm at runtime, so poppler_utils must be on PATH.
   processorBin = pkgs.writeShellScriptBin "qr-mail-processor" ''
     export PATH="/run/wrappers/bin:${pkgs.poppler-utils}/bin:${pkgs.tesseract}/bin:$PATH"
+    export PYTHONPATH=${src}
     export ADMIN_EMAIL=${lib.escapeShellArg cfg.adminEmail}
     export MY_ADDRESS=${lib.escapeShellArg cfg.myAddress}
     export ALLOWED_SENDERS=${lib.escapeShellArg (lib.concatStringsSep ":" cfg.allowedSenders)}
@@ -51,16 +45,17 @@ let
     export SMTP_USER=${lib.escapeShellArg cfg.smtpUser}
     export SMTP_PASSWORD=${lib.escapeShellArg cfg.smtpPassword}
     export SMTP_TLS=${lib.escapeShellArg cfg.smtpTls}
-    exec ${python}/bin/python3 ${src}/mail_processor.py "$@"
+    exec ${python}/bin/python3 ${src}/scripts/mail_processor.py "$@"
   '';
   gmailFetcherBin = pkgs.writeShellScriptBin "qr-mail-gmail-fetch" ''
+    export PYTHONPATH=${src}
     export GMAIL_IMPERSONATE_ADDRESS=${lib.escapeShellArg cfg.gmailImpersonateAddress}
     export GMAIL_POLL_INTERVAL_S=${toString cfg.gmailPollIntervalSeconds}
     export GMAIL_PROCESSED_LABEL=${lib.escapeShellArg cfg.gmailProcessedLabel}
     export PROCESSOR_BIN=${processorBin}/bin/qr-mail-processor
     # Service account file path is passed at runtime via GMAIL_SERVICE_ACCOUNT_FILE
     # so that the secret never lands in the Nix store.
-    exec ${python}/bin/python3 ${src}/gmail_fetch.py "$@"
+    exec ${python}/bin/python3 ${src}/scripts/gmail_fetch.py "$@"
   '';
 in
 {

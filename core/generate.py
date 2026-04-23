@@ -12,8 +12,8 @@ Public API:
 """
 import io
 
-from epc import EPC, CHARSETS
-from upn import UPN, UPNReferenceError, validate_upn_reference
+from core.epc import EPC, CHARSETS
+from core.upn import UPN, UPNReferenceError, validate_upn_reference
 
 DEFAULT_EPC_BENEFICIARY_NAME = "PREJEMNIK"
 

@@ -1,7 +1,7 @@
 import unittest
 
-from epc import EPC, EPCParseError, parse_epc
-from generate import epc_to_string
+from core.epc import EPC, EPCParseError, parse_epc
+from core.generate import epc_to_string
 
 
 class TestEPC(unittest.TestCase):

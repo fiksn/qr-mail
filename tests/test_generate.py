@@ -1,7 +1,7 @@
 import unittest
 
-from generate import upn_to_epc
-from upn import UPN
+from core.generate import upn_to_epc
+from core.upn import UPN
 
 
 class TestUPNToEPC(unittest.TestCase):

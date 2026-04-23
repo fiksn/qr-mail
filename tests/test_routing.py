@@ -1,6 +1,6 @@
 import unittest
 
-from routing import find_route, parse_allowed_sender_routes
+from core.routing import find_route, parse_allowed_sender_routes
 
 
 class TestRouting(unittest.TestCase):

@@ -3,7 +3,7 @@
 Debug CLI: process a PDF/image as if it arrived as an email attachment.
 
 Usage:
-  python3 debug_process.py [OPTIONS] FILE [FILE ...]
+  python3 scripts/debug_process.py [OPTIONS] FILE [FILE ...]
 
 Options:
   --output FILE   write forwarded .eml to FILE (default: stdout)
@@ -16,8 +16,8 @@ Environment (all optional, sensible defaults applied):
   MY_ADDRESS      (default: me@example.com)
 
 Example:
-  python3 debug_process.py racun_26-390-0438150.pdf --output out.eml
-  python3 debug_process.py racun_26-390-0438150.pdf --dump-qr
+  python3 scripts/debug_process.py racun_26-390-0438150.pdf --output out.eml
+  python3 scripts/debug_process.py racun_26-390-0438150.pdf --dump-qr
 """
 import argparse
 import email
@@ -34,7 +34,10 @@ os.environ.setdefault("ADMIN_EMAIL", "admin@example.com")
 os.environ.setdefault("MY_ADDRESS", "me@example.com")
 os.environ.setdefault("ALLOWED_SENDERS", "*")
 
-from mail_processor import (
+if __package__ in {None, ""}:
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from scripts.mail_processor import (
     build_forward,
     dedupe_qr_results,
     find_payments,

@@ -1,7 +1,7 @@
 """Tests for text_extract: IBAN + reference pair extraction."""
 import pytest
 
-from text_extract import (
+from parsers.text_extract import (
     _normalize_iban,
     _normalize_reference,
     build_upn_from_text,

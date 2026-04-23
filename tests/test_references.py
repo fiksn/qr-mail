@@ -1,6 +1,6 @@
 import unittest
 
-from upn import UPNReferenceError, _si_mod11_check_digit, validate_upn_reference
+from core.upn import UPNReferenceError, _si_mod11_check_digit, validate_upn_reference
 
 
 def _check(body: str) -> int:

@@ -2,7 +2,8 @@ import unittest
 from email.mime.multipart import MIMEMultipart
 from unittest import mock
 
-from mail_processor import (
+from core.upn import UPN
+from scripts.mail_processor import (
     GmailConfig,
     PaymentItem,
     SmtpConfig,
@@ -10,7 +11,6 @@ from mail_processor import (
     _merge_payments_with_precedence,
     _send_mail,
 )
-from upn import UPN
 
 
 def _upn(*, iban: str, reference: str, name: str) -> UPN:
@@ -41,11 +41,14 @@ class TestPaymentPrecedence(unittest.TestCase):
         iban = "SI56020100012345678"
         reference = "SI00123"
 
-        payments = _merge_payments_with_precedence(
-            text_upns=[(_upn(iban=iban, reference=reference, name="Text"), "email-body")],
-            eslog_upns=[(_upn(iban=iban, reference=reference, name="eSLOG"), "invoice.xml (eSLOG XML)")],
-            qr_payments=[],
-        )
+        with mock.patch("scripts.mail_processor.generate_upn_slip_png", return_value=b"slip"), mock.patch(
+            "scripts.mail_processor.generate_epc_qr", return_value=b"epc"
+        ):
+            payments = _merge_payments_with_precedence(
+                text_upns=[(_upn(iban=iban, reference=reference, name="Text"), "email-body")],
+                eslog_upns=[(_upn(iban=iban, reference=reference, name="eSLOG"), "invoice.xml (eSLOG XML)")],
+                qr_payments=[],
+            )
 
         self.assertEqual(len(payments), 1)
         self.assertEqual(payments[0].upn.recipient_name, "eSLOG")
@@ -135,9 +138,9 @@ class TestOutboundTransport(unittest.TestCase):
             impersonate_address="qr@example.com",
         )
 
-        with mock.patch("mail_processor._send_mail_via_gmail_api") as gmail_send, \
-             mock.patch("mail_processor.smtplib.SMTP") as smtp_send, \
-             mock.patch("mail_processor.subprocess.run") as sendmail_run:
+        with mock.patch("scripts.mail_processor._send_mail_via_gmail_api") as gmail_send, \
+             mock.patch("scripts.mail_processor.smtplib.SMTP") as smtp_send, \
+             mock.patch("scripts.mail_processor.subprocess.run") as sendmail_run:
             _send_mail(fwd, "qr@example.com", recipients, smtp_cfg, gmail_cfg)
 
         gmail_send.assert_called_once_with(fwd, recipients, gmail_cfg)

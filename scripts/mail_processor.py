@@ -36,7 +36,7 @@ Standalone usage:
   ADMIN_EMAIL=admin@example.com \
   MY_ADDRESS=test@example.com \
   ALLOWED_SENDERS="*@trusted.com:alice@*" \
-  python3 mail_processor.py < message.eml
+  python3 scripts/mail_processor.py < message.eml
 """
 from __future__ import annotations
 
@@ -48,11 +48,11 @@ import io
 import hashlib
 import logging
 import os
+import signal
 import smtplib
 import subprocess
 import sys
 import tempfile
-import signal
 from dataclasses import dataclass, field
 from email.mime.base import MIMEBase
 from email.mime.image import MIMEImage
@@ -61,24 +61,27 @@ from email.mime.text import MIMEText
 from email.utils import parseaddr
 from typing import Any, Optional
 
-from epc import EPC, EPCParseError, format_epc, parse_epc
-from eslog import ESlogParseError, parse_eslog_invoice
-from generate import epc_to_string, generate_epc_qr, upn_to_epc
-from generate_qr import generate_upn_slip_png
-from text_extract import (
-    build_upn_from_text,
-    extract_image_text_from_bytes,
-    extract_pdf_text,
-    find_iban_reference_pairs,
-)
-from routing import (
+if __package__ in {None, ""}:
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from core.epc import EPC, EPCParseError, format_epc, parse_epc
+from core.generate import epc_to_string, generate_epc_qr, upn_to_epc
+from core.routing import (
     find_route,
     is_allowed_sender,
     matches,
     parse_allowed_sender_routes,
     parse_allowed_senders,
 )
-from upn import UPN, UPNParseError, UPNReferenceError, format_upn, parse_upn, validate_upn_reference
+from core.upn import UPN, UPNParseError, UPNReferenceError, format_upn, parse_upn, validate_upn_reference
+from parsers.eslog import ESlogParseError, parse_eslog_invoice
+from parsers.text_extract import (
+    build_upn_from_text,
+    extract_image_text_from_bytes,
+    extract_pdf_text,
+    find_iban_reference_pairs,
+)
+from scripts.generate_qr import generate_upn_slip_png
 
 logging.basicConfig(
     stream=sys.stderr, level=logging.DEBUG,

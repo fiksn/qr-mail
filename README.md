@@ -49,17 +49,34 @@ services.qrMail = {
 ## Other uses
 
 You can still use the python tooling independently of Nix, for instance to convert or craft payment QR codes.
+All executable entry points now live under `scripts/`.
 
 Example:
 ```bash
-python3 generate_qr.py --format both        # UPN + EPC QR PNGs
-python3 generate_qr.py --format slip        # full UPN poloznica PNG (pink form + QR)
-python3 generate_qr.py --format all         # UPN + EPC + poloznica
-python3 generate_qr.py --format slip --slip-template ./UPN-1.jpg
+python3 scripts/generate_qr.py --format both        # UPN + EPC QR PNGs
+python3 scripts/generate_qr.py --format slip        # full UPN poloznica PNG (pink form + QR)
+python3 scripts/generate_qr.py --format all         # UPN + EPC + poloznica
+python3 scripts/generate_qr.py --format slip --slip-template ./UPN-1.jpg
+python3 scripts/debug_process.py invoice.pdf --output out.eml
+ADMIN_EMAIL=admin@example.com MY_ADDRESS=qr@example.com ALLOWED_SENDERS='*@example.com' \
+  python3 scripts/mail_processor.py < message.eml
 ```
 
 Note: `--format slip` / `--format all` needs Pillow (`pip install pillow`).
 Default slip template path is `./upn_base_empty.jpg` (bundled in repo).
+
+If you use the Nix dev shell, the same commands work via:
+```bash
+nix develop -c python3 scripts/generate_qr.py --format both
+nix develop -c python3 scripts/debug_process.py invoice.pdf
+```
+
+Project layout:
+
+- `core/` payment models, routing, and EPC/UPN conversion helpers
+- `parsers/` eSLOG and text extraction logic
+- `scripts/` runnable CLIs and mail-processing entry points
+- `tests/` test suite
 
 ## Google Workspace Fetching
 

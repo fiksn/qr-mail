@@ -2,7 +2,7 @@ from datetime import date
 
 import pytest
 
-from eslog import ESlogParseError, parse_eslog_invoice
+from parsers.eslog import ESlogParseError, parse_eslog_invoice
 
 
 def test_parse_eslog_invoice_with_payee_and_payment_fields() -> None:

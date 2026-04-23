@@ -19,8 +19,8 @@ import subprocess
 import tempfile
 from typing import Any, Optional
 
-from epc import EPCParseError, _validate_iban
-from upn import UPN, UPNReferenceError, validate_upn_reference
+from core.epc import EPCParseError, _validate_iban
+from core.upn import UPN, UPNReferenceError, validate_upn_reference
 
 log = logging.getLogger(__name__)
 

@@ -2,29 +2,32 @@
 """Interactive CLI to generate UPN and EPC SCT payment outputs.
 
 Usage:
-  python3 generate_qr.py
-  python3 generate_qr.py --output invoice_123   # filename prefix for saved PNGs
+  python3 scripts/generate_qr.py
+  python3 scripts/generate_qr.py --output invoice_123   # filename prefix for saved PNGs
 """
 import argparse
-import sys
 import io
 import os
+import sys
 from dataclasses import replace
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
 
-from generate import (
+if __package__ in {None, ""}:
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from core.generate import (
     epc_to_string,
     generate_epc_qr,
     generate_upn_qr,
     upn_to_epc,
     upn_to_string,
 )
-from upn import UPN, UPNReferenceError, validate_upn_reference
+from core.upn import UPN, UPNReferenceError, validate_upn_reference
 
 DEFAULT_SLIP_TEMPLATE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "upn_base_empty.jpg",
 )
 

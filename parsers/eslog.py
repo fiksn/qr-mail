@@ -20,8 +20,8 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 import xml.etree.ElementTree as ET
 
-from epc import EPCParseError, _validate_iban
-from upn import UPN
+from core.epc import EPCParseError, _validate_iban
+from core.upn import UPN
 
 NS_URI = "urn:eslog:2.00"
 NS = {"e": NS_URI}
