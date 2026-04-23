@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Extract IBAN + SI/RF reference pairs from plain text, PDFs, and images.
 
 Scans text for Slovenian IBANs (validated via MOD97) and nearby SI/RF
@@ -15,9 +17,7 @@ import os
 import re
 import subprocess
 import tempfile
-from typing import Optional
-
-from PIL import Image
+from typing import Any, Optional
 
 from epc import EPCParseError, _validate_iban
 from upn import UPN, UPNReferenceError, validate_upn_reference
@@ -156,7 +156,7 @@ def extract_pdf_text(pdf_bytes: bytes) -> str:
         return ""
 
 
-def extract_image_text(img: Image.Image) -> str:
+def extract_image_text(img: Any) -> str:
     """Extract text from an image via OCR (pytesseract).
 
     Returns empty string if pytesseract or tesseract is not installed.
@@ -189,8 +189,13 @@ def extract_image_text(img: Image.Image) -> str:
 def extract_image_text_from_bytes(data: bytes) -> str:
     """Load image bytes and run OCR. Returns empty string on failure."""
     try:
+        from PIL import Image
+
         img = Image.open(io.BytesIO(data))
         img.load()
+    except ImportError:
+        log.info("Pillow not installed; image OCR disabled")
+        return ""
     except Exception as exc:
         log.warning("image load for OCR failed: %s", exc)
         return ""

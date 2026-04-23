@@ -33,6 +33,8 @@ Standalone usage:
   ALLOWED_SENDERS="*@trusted.com:alice@*" \
   python3 mail_processor.py < message.eml
 """
+from __future__ import annotations
+
 import email
 import email.encoders
 import html
@@ -51,12 +53,7 @@ from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import parseaddr
-from typing import Optional
-
-import pdf2image
-from pdf2image.exceptions import PDFPageCountError
-from PIL import Image
-from pyzbar import pyzbar
+from typing import Any, Optional
 
 from epc import EPC, EPCParseError, format_epc, parse_epc
 from eslog import ESlogParseError, parse_eslog_invoice
@@ -167,10 +164,15 @@ def _decode_qr_bytes(data: bytes) -> str:
         return data.decode("iso-8859-2", errors="replace")
 
 
-def scan_image_for_qr(img: Image.Image) -> list[str]:
+def scan_image_for_qr(img: Any) -> list[str]:
     try:
+        from pyzbar import pyzbar
+
         results = pyzbar.decode(img, symbols=[pyzbar.ZBarSymbol.QRCODE])
         return [_decode_qr_bytes(r.data) for r in results]
+    except ImportError:
+        log.info("pyzbar not installed; QR decoding disabled")
+        return []
     except Exception as exc:
         log.warning("pyzbar decode error: %s", exc)
         return []
@@ -180,6 +182,9 @@ def scan_pdf_for_qr(data: bytes) -> list[tuple[str, int]]:
     """Render each PDF page and scan for QR codes."""
     codes: list[tuple[str, int]] = []
     try:
+        import pdf2image
+        from pdf2image.exceptions import PDFPageCountError
+
         max_pages = int(os.environ.get("MAX_PDF_PAGES", DEFAULT_MAX_PDF_PAGES))
         dpi = int(os.environ.get("PDF_RENDER_DPI", DEFAULT_PDF_RENDER_DPI))
         timeout_s = int(os.environ.get("PDF_RENDER_TIMEOUT_S", DEFAULT_PDF_RENDER_TIMEOUT_S))
@@ -190,6 +195,9 @@ def scan_pdf_for_qr(data: bytes) -> list[tuple[str, int]]:
             last_page=max_pages,
             timeout=timeout_s,
         )
+    except ImportError:
+        log.info("pdf2image not installed; PDF QR scanning disabled")
+        return codes
     except PDFPageCountError as exc:
         log.warning("pdf2image failed to read page count: %s", exc)
         return codes
@@ -207,9 +215,14 @@ def scan_pdf_for_qr(data: bytes) -> list[tuple[str, int]]:
 
 def scan_image_bytes_for_qr(data: bytes) -> list[str]:
     try:
+        from PIL import Image
+
         Image.MAX_IMAGE_PIXELS = int(os.environ.get("MAX_IMAGE_PIXELS", DEFAULT_MAX_IMAGE_PIXELS))
         img = Image.open(io.BytesIO(data))
         img.load()
+    except ImportError:
+        log.info("Pillow not installed; image QR scanning disabled")
+        return []
     except Image.DecompressionBombError as exc:
         log.warning("image rejected (decompression bomb): %s", exc)
         return []
