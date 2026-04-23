@@ -73,6 +73,7 @@ Alternatively instead of postfix this tool can use Google Workspace API as well.
 2. Google Workspace Admin (admin.google.com)
   - Security → Access and data control → API controls → Domain-wide delegation
   - Add client ID (from client_id field above) with scope:
-https://www.googleapis.com/auth/gmail.modify
+https://www.googleapis.com/auth/gmail.modify,https://www.googleapis.com/auth/gmail.send
 (modify = read + label; readonly if you prefer to mark-read via a separate mechanism)
 3. The dedicated Workspace account (e.g. qr@yourdomain.com) is the address the service account impersonates — it doesn't need any special permissions itself, just needs to exist and receive mail.
+4. When `gmailServiceAccountFile` is configured, outbound replies/forwards are also sent through the Gmail API automatically using the same impersonated mailbox.

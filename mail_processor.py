@@ -26,6 +26,11 @@ Configuration via environment variables:
   SMTP_USER              SMTP username for auth (optional)
   SMTP_PASSWORD          SMTP password for auth (optional)
   SMTP_TLS               TLS mode: starttls (default), tls (implicit/SMTPS), or none
+  GMAIL_SERVICE_ACCOUNT_FILE
+                         when set together with GMAIL_IMPERSONATE_ADDRESS, send
+                         outbound mail via Gmail API instead of sendmail/SMTP
+  GMAIL_IMPERSONATE_ADDRESS
+                         Google Workspace mailbox to impersonate for Gmail API send
 
 Standalone usage:
   ADMIN_EMAIL=admin@example.com \
@@ -35,6 +40,7 @@ Standalone usage:
 """
 from __future__ import annotations
 
+import base64
 import email
 import email.encoders
 import html
@@ -97,6 +103,12 @@ class SmtpConfig:
     user: str
     password: str
     tls: str  # "starttls", "tls", or "none"
+
+
+@dataclass
+class GmailConfig:
+    service_account_file: str
+    impersonate_address: str
 
 
 class MessageProcessingTimeout(RuntimeError):
@@ -853,14 +865,51 @@ def _load_smtp_config() -> Optional[SmtpConfig]:
     )
 
 
+def _load_gmail_config() -> Optional[GmailConfig]:
+    service_account_file = os.environ.get("GMAIL_SERVICE_ACCOUNT_FILE", "").strip()
+    impersonate_address = os.environ.get("GMAIL_IMPERSONATE_ADDRESS", "").strip()
+    if not service_account_file or not impersonate_address:
+        return None
+    return GmailConfig(
+        service_account_file=service_account_file,
+        impersonate_address=impersonate_address,
+    )
+
+
+def _send_mail_via_gmail_api(
+    fwd: MIMEMultipart,
+    recipients: list[str],
+    gmail_cfg: GmailConfig,
+) -> None:
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+
+    creds = service_account.Credentials.from_service_account_file(
+        gmail_cfg.service_account_file,
+        scopes=["https://www.googleapis.com/auth/gmail.send"],
+    ).with_subject(gmail_cfg.impersonate_address)
+    service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+
+    raw = base64.urlsafe_b64encode(fwd.as_bytes()).decode("ascii")
+    service.users().messages().send(
+        userId="me",
+        body={"raw": raw},
+    ).execute()
+    log.debug("Gmail API: sent to %s", recipients)
+
+
 def _send_mail(
     fwd: MIMEMultipart,
     my_address: str,
     recipients: list[str],
     smtp_cfg: Optional[SmtpConfig],
+    gmail_cfg: Optional[GmailConfig],
 ) -> None:
-    """Send the forwarded message via sendmail or SMTP."""
+    """Send the forwarded message via Gmail API, sendmail, or SMTP."""
     msg_bytes = fwd.as_bytes()
+    if gmail_cfg is not None:
+        _send_mail_via_gmail_api(fwd, recipients, gmail_cfg)
+        return
     if smtp_cfg is None:
         # Inject via sendmail binary — queues directly into Postfix spool,
         # no live SMTP connection needed. On NixOS: /run/wrappers/bin/sendmail
@@ -960,7 +1009,7 @@ def main() -> None:
         recipients = [admin_email]
 
     recipients = list(dict.fromkeys(recipients))  # dedupe, preserve order
-    _send_mail(fwd, my_address, recipients, _load_smtp_config())
+    _send_mail(fwd, my_address, recipients, _load_smtp_config(), _load_gmail_config())
 
 
 if __name__ == "__main__":

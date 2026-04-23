@@ -196,6 +196,7 @@ in
       description = ''
         SMTP server hostname. When set, outbound mail is sent via SMTP instead
         of the local sendmail binary. Leave empty to use sendmail (default).
+        Ignored when <option>gmailServiceAccountFile</option> is set.
       '';
     };
 
@@ -241,8 +242,9 @@ in
       description = ''
         Path to a Google service account JSON key file with domain-wide
         delegation enabled for the Gmail API. When set, a polling daemon
-        (<literal>qr-mail-gmail-fetch</literal>) is started alongside the
-        Postfix pipe handler.
+        (<literal>qr-mail-gmail-fetch</literal>) is started and outbound mail
+        is sent through the Gmail API using the same impersonated mailbox,
+        instead of Postfix/sendmail or SMTP.
 
         The file must be readable by the <literal>qr-mail</literal> system
         user. Use a secrets manager (e.g. sops-nix) so the key does not land
