@@ -12,6 +12,18 @@ Exit codes:
   0  success (valid signature or unsigned document)
   1  invalid signature or parse error
   2  usage error
+
+By default, intermediate CA certificates are loaded from
+``slo-intermediates.pem`` in the repository root. Set
+``ESLOG_INTERMEDIATE_CERTS_FILE`` to override that with a different PEM
+file. Mixed CA bundles are also accepted: self-signed roots from that
+file are promoted to trust anchors automatically.
+
+Set ``ESLOG_TRUSTED_CERTS_FILE`` to add PEM trust anchors explicitly.
+
+Set ``SLOG_SKIP_CHAIN_VALIDATION=1`` or ``ESLOG_SKIP_CHAIN_VALIDATION=1``
+to skip certificate trust-chain validation and verify only the XML
+signature and digest references.
 """
 from __future__ import annotations
 
@@ -53,11 +65,24 @@ def main() -> None:
         )
         if sig.signer.signing_time:
             print(f"  Signed:  {sig.signer.signing_time}", file=sys.stderr)
+        if sig.chain:
+            print("  Chain:", file=sys.stderr)
+            for idx, cert in enumerate(sig.chain, start=1):
+                print(f"    {idx}. Subject: {cert.subject}", file=sys.stderr)
+                print(f"       Issuer:  {cert.issuer}", file=sys.stderr)
+                print(
+                    f"       Valid:   {cert.not_before} — {cert.not_after}",
+                    file=sys.stderr,
+                )
+        for warning in sig.warnings:
+            print(f"  Warning: {warning}", file=sys.stderr)
     elif sig.valid is False:
         print(f"Signature: INVALID ({sig.error})", file=sys.stderr)
         sys.exit(1)
     elif sig.valid is None:
         print(f"Signature: COULD NOT VERIFY ({sig.error})", file=sys.stderr)
+        for warning in sig.warnings:
+            print(f"  Warning: {warning}", file=sys.stderr)
 
     # ── Parse eSLOG invoice ─────────────────────────────────────────────
     try:

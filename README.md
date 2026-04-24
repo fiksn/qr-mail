@@ -42,9 +42,17 @@ services.qrMail = {
    adminEmail = "admin@trusted-domain.tld";
    trustedSenders = [ "*@trusted-domain.tld" ];
    allowedSenders = [ "forwarding-noreply@google.com" ];
+   eslogTrustedCertsFile = "/etc/ssl/certs/eslog-extra-trust.pem";
    catchAllWorkaround = true;
 };
 ```
+
+Notes:
+
+- Outbound SMTP now verifies certificates and hostnames by default. Only disable this if you fully control the relay and cannot fix its TLS.
+- Gmail polling mode no longer trusts the raw `From:` header as a sender identity. Messages are processed only when Gmail authentication results show aligned SPF/DKIM/DMARC success for that `From:` domain.
+- eSLOG XML signatures are now accepted as `valid` only when the signer certificate chains to a trusted CA. System trust roots are used automatically, the bundled `slo-intermediates.pem` is used by default for missing intermediates, and `ESLOG_INTERMEDIATE_CERTS_FILE` overrides that default when needed. `eslogTrustedCertsFile` can add extra PEM trust anchors. Mixed CA bundles are accepted too: roots in the intermediate PEM are promoted to trust anchors automatically.
+- For debugging only, set `SLOG_SKIP_CHAIN_VALIDATION=1` (or the legacy `ESLOG_SKIP_CHAIN_VALIDATION=1`) to skip certificate chain validation while still checking the XML signature and digest references.
 
 ## Other uses
 

@@ -13,15 +13,24 @@ ancestor namespace declarations manually and hash the raw result.
 from __future__ import annotations
 
 import base64
+from datetime import UTC, datetime
+from functools import lru_cache
 import hashlib
 import logging
+import os
 import re
+import ssl
+import warnings
 from dataclasses import dataclass, field
 from typing import Optional
 
 import defusedxml.ElementTree as ET
 
 log = logging.getLogger(__name__)
+DEFAULT_INTERMEDIATE_CERTS_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "slo-intermediates.pem",
+)
 
 NS_ESLOG = "urn:eslog:2.00"
 NS_DS = "http://www.w3.org/2000/09/xmldsig#"
@@ -54,14 +63,43 @@ class SignerInfo:
 
 
 @dataclass
+class CertificateInfo:
+    """X.509 certificate details used for trust-chain reporting."""
+
+    subject: str
+    issuer: str
+    not_before: str
+    not_after: str
+
+
+@dataclass
 class SignatureResult:
     """Outcome of XMLDSig extraction and verification."""
 
     signed: bool
     valid: Optional[bool] = None  # None = could not verify
     signer: Optional[SignerInfo] = None
+    chain: list[CertificateInfo] = field(default_factory=list)
     error: Optional[str] = None
     warnings: list[str] = field(default_factory=list)
+
+
+def _env_flag(name: str) -> bool:
+    value = os.environ.get(name, "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _skip_chain_validation_enabled() -> bool:
+    return _env_flag("ESLOG_SKIP_CHAIN_VALIDATION") or _env_flag("SLOG_SKIP_CHAIN_VALIDATION")
+
+
+def _get_intermediate_certs_file() -> str:
+    configured = os.environ.get("ESLOG_INTERMEDIATE_CERTS_FILE", "").strip()
+    if configured:
+        return configured
+    if os.path.exists(DEFAULT_INTERMEDIATE_CERTS_FILE):
+        return DEFAULT_INTERMEDIATE_CERTS_FILE
+    return ""
 
 
 def _collect_root_ns_decls(xml_text: str) -> str:
@@ -147,6 +185,15 @@ def _format_x509_name(name) -> str:
     return ", ".join(parts)
 
 
+def _cert_info_from_cert(cert) -> CertificateInfo:
+    return CertificateInfo(
+        subject=_format_x509_name(cert.subject),
+        issuer=_format_x509_name(cert.issuer),
+        not_before=cert.not_valid_before_utc.strftime("%Y-%m-%d %H:%M:%S UTC"),
+        not_after=cert.not_valid_after_utc.strftime("%Y-%m-%d %H:%M:%S UTC"),
+    )
+
+
 def _parse_cert(cert_der: bytes) -> Optional[SignerInfo]:
     """Parse an X.509 certificate from DER bytes."""
     try:
@@ -161,12 +208,199 @@ def _parse_cert(cert_der: bytes) -> Optional[SignerInfo]:
         log.warning("failed to parse X.509 certificate: %s", exc)
         return None
 
+    info = _cert_info_from_cert(cert)
     return SignerInfo(
-        subject=_format_x509_name(cert.subject),
-        issuer=_format_x509_name(cert.issuer),
-        not_before=cert.not_valid_before_utc.strftime("%Y-%m-%d %H:%M:%S UTC"),
-        not_after=cert.not_valid_after_utc.strftime("%Y-%m-%d %H:%M:%S UTC"),
+        subject=info.subject,
+        issuer=info.issuer,
+        not_before=info.not_before,
+        not_after=info.not_after,
     )
+
+
+def _parse_signing_time(raw: str) -> Optional[datetime]:
+    value = raw.strip()
+    if not value:
+        return None
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _decode_certificates(sig_elem: ET.Element) -> tuple[list[bytes], Optional[str]]:
+    cert_ders: list[bytes] = []
+    for cert_elem in sig_elem.findall(".//ds:X509Certificate", _NS):
+        if cert_elem.text is None:
+            continue
+        cert_b64 = cert_elem.text.strip()
+        if not cert_b64:
+            continue
+        try:
+            cert_ders.append(base64.b64decode(cert_b64))
+        except Exception as exc:
+            return [], f"invalid X509Certificate base64: {exc}"
+    if not cert_ders:
+        return [], "signature present but no X509Certificate found"
+    return cert_ders, None
+
+
+@lru_cache(maxsize=8)
+def _load_pem_certs(pem_path: str) -> tuple:
+    """Load certificates from a PEM file (cached)."""
+    from cryptography import x509
+
+    with open(pem_path, "rb") as f:
+        pem_bytes = f.read()
+    return tuple(x509.load_pem_x509_certificates(pem_bytes))
+
+
+def _is_self_signed(cert) -> bool:
+    return cert.subject == cert.issuer
+
+
+@lru_cache(maxsize=8)
+def _load_trust_anchors(extra_pem_path: str) -> tuple:
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.utils import CryptographyDeprecationWarning
+
+    anchors = []
+    seen: set[bytes] = set()
+
+    ctx = ssl.create_default_context()
+    for der in ctx.get_ca_certs(binary_form=True):
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", CryptographyDeprecationWarning)
+                cert = x509.load_der_x509_certificate(der)
+        except Exception as exc:
+            log.debug("skipping unreadable system trust anchor: %s", exc)
+            continue
+        fp = cert.fingerprint(hashes.SHA256())
+        if fp not in seen:
+            seen.add(fp)
+            anchors.append(cert)
+
+    if extra_pem_path:
+        for cert in _load_pem_certs(extra_pem_path):
+            fp = cert.fingerprint(hashes.SHA256())
+            if fp not in seen:
+                seen.add(fp)
+                anchors.append(cert)
+
+    return tuple(anchors)
+
+
+def _build_certificate_chain(leaf, intermediates: list, anchors: list) -> list[CertificateInfo]:
+    from cryptography.hazmat.primitives import hashes
+
+    chain = [_cert_info_from_cert(leaf)]
+    current = leaf
+    seen = {leaf.fingerprint(hashes.SHA256())}
+
+    while current.subject != current.issuer:
+        next_cert = None
+        for pool in (intermediates, anchors):
+            for candidate in pool:
+                fingerprint = candidate.fingerprint(hashes.SHA256())
+                if fingerprint in seen:
+                    continue
+                if candidate.subject == current.issuer:
+                    next_cert = candidate
+                    seen.add(fingerprint)
+                    break
+            if next_cert is not None:
+                break
+        if next_cert is None:
+            break
+        chain.append(_cert_info_from_cert(next_cert))
+        current = next_cert
+
+    return chain
+
+
+def _verify_certificate_trust(
+    cert_chain_ders: list[bytes],
+    *,
+    signing_time: Optional[datetime],
+) -> tuple[bool, str, list[CertificateInfo]]:
+    try:
+        from cryptography import x509
+        from cryptography.x509.verification import PolicyBuilder, Store, VerificationError
+    except ImportError:
+        return False, "cryptography library not installed", []
+
+    if not cert_chain_ders:
+        return False, "no signer certificate found", []
+
+    try:
+        leaf = x509.load_der_x509_certificate(cert_chain_ders[0])
+        intermediates = [
+            x509.load_der_x509_certificate(cert_der)
+            for cert_der in cert_chain_ders[1:]
+        ]
+    except Exception as exc:
+        return False, f"failed to parse certificate chain: {exc}", []
+
+    extra_trust_file = os.environ.get("ESLOG_TRUSTED_CERTS_FILE", "").strip()
+    try:
+        anchors = list(_load_trust_anchors(extra_trust_file))
+    except FileNotFoundError:
+        return False, f"trust anchor file not found: {extra_trust_file}", []
+    except Exception as exc:
+        return False, f"failed to load trust anchors: {exc}", []
+
+    if not anchors:
+        return False, "no trust anchors available", []
+
+    from cryptography.hazmat.primitives import hashes
+
+    anchor_fingerprints = {
+        cert.fingerprint(hashes.SHA256())
+        for cert in anchors
+    }
+    intermediate_fingerprints = {
+        cert.fingerprint(hashes.SHA256())
+        for cert in intermediates
+    }
+
+    # Load externally-provided intermediate certificates. Mixed CA bundles are
+    # accepted here: self-signed roots and known trust anchors are promoted into
+    # the trust store instead of being passed as intermediates.
+    intermediate_file = _get_intermediate_certs_file()
+    if intermediate_file:
+        try:
+            for cert in _load_pem_certs(intermediate_file):
+                fingerprint = cert.fingerprint(hashes.SHA256())
+                if fingerprint in intermediate_fingerprints:
+                    continue
+                if _is_self_signed(cert) or fingerprint in anchor_fingerprints:
+                    if fingerprint not in anchor_fingerprints:
+                        anchor_fingerprints.add(fingerprint)
+                        anchors.append(cert)
+                    continue
+                intermediate_fingerprints.add(fingerprint)
+                intermediates.append(cert)
+        except FileNotFoundError:
+            return False, f"intermediate certs file not found: {intermediate_file}", []
+        except Exception as exc:
+            return False, f"failed to load intermediate certs: {exc}", []
+
+    verify_time = signing_time or datetime.now(UTC)
+    chain = _build_certificate_chain(leaf, intermediates, anchors)
+    try:
+        verifier = PolicyBuilder().store(Store(anchors)).time(verify_time).build_client_verifier()
+        verifier.verify(leaf, intermediates)
+        return True, "trusted certificate chain", chain
+    except VerificationError as exc:
+        return False, f"certificate trust verification failed: {exc}", chain
+    except Exception as exc:
+        return False, f"certificate trust verification failed: {exc}", chain
 
 
 def _verify_rsa(
@@ -290,33 +524,27 @@ def verify_eslog_signature(xml_bytes: bytes) -> SignatureResult:
     if sig_elem is None:
         return SignatureResult(signed=False)
 
-    # Extract certificate.
-    cert_elem = sig_elem.find(".//ds:X509Certificate", _NS)
-    if cert_elem is None or not cert_elem.text:
+    cert_chain_ders, cert_error = _decode_certificates(sig_elem)
+    if cert_error is not None:
         return SignatureResult(
             signed=True,
             valid=None,
-            error="signature present but no X509Certificate found",
+            error=cert_error,
         )
-
-    cert_b64 = cert_elem.text.strip()
-    try:
-        cert_der = base64.b64decode(cert_b64)
-    except Exception as exc:
-        return SignatureResult(
-            signed=True,
-            valid=None,
-            error=f"invalid X509Certificate base64: {exc}",
-        )
-
+    cert_der = cert_chain_ders[0]
     signer = _parse_cert(cert_der)
 
     # Extract signing time from XAdES.
     signing_time_elem = sig_elem.find(
         ".//xds:SignedSignatureProperties/xds:SigningTime", _NS,
     )
+    signing_time: Optional[datetime] = None
+    warnings: list[str] = []
     if signer and signing_time_elem is not None and signing_time_elem.text:
         signer.signing_time = signing_time_elem.text.strip()
+        signing_time = _parse_signing_time(signer.signing_time)
+        if signing_time is None:
+            warnings.append(f"unparseable signing time: {signer.signing_time!r}")
 
     # Extract signature value.
     sig_val_elem = sig_elem.find("ds:SignatureValue", _NS)
@@ -374,7 +602,6 @@ def verify_eslog_signature(xml_bytes: bytes) -> SignatureResult:
         )
 
     # 2. Verify each ds:Reference digest.
-    warnings: list[str] = []
     for ref in signed_info.findall("ds:Reference", _NS):
         uri = ref.get("URI", "")
         digest_method = ref.find("ds:DigestMethod", _NS)
@@ -397,6 +624,19 @@ def verify_eslog_signature(xml_bytes: bytes) -> SignatureResult:
             )
         log.debug("XMLDSig: %s", msg)
 
+    trust_ok, trust_msg, chain = _verify_certificate_trust(
+        cert_chain_ders,
+        signing_time=signing_time,
+    )
+    if not trust_ok and _skip_chain_validation_enabled():
+        warnings.append(f"skipped certificate chain validation ({trust_msg})")
+        trust_ok = True
+    if not trust_ok:
+        return SignatureResult(
+            signed=True, valid=False, signer=signer,
+            chain=chain, error=trust_msg, warnings=warnings,
+        )
+
     return SignatureResult(
-        signed=True, valid=True, signer=signer, warnings=warnings,
+        signed=True, valid=True, signer=signer, chain=chain, warnings=warnings,
     )

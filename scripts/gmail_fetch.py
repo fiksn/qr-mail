@@ -13,18 +13,18 @@ Configuration via environment variables:
   PROCESSOR_BIN                processor executable path (default: qr-mail-processor)
 
 The processor binary is invoked as a subprocess and receives the raw RFC 2822
-message on stdin — identical to what Postfix delivers via the pipe transport.
+message on stdin. Unlike the Postfix path, Gmail does not provide a trustworthy
+envelope sender to the processor, so the processor must derive a verified sender
+from authentication headers within the message.
 All ADMIN_EMAIL / MY_ADDRESS / ALLOWED_SENDERS etc. must be set in the
 processor's own environment (the NixOS module handles this via its shell wrapper).
 """
 import base64
-import email
 import logging
 import os
 import subprocess
 import sys
 import time
-from email.utils import parseaddr
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -93,18 +93,12 @@ def _mark_processed(service, msg_id: str, processed_label_id: str) -> None:
     ).execute()
 
 
-def _extract_sender(raw: bytes) -> str:
-    """Extract the From address from raw RFC 2822 bytes."""
-    msg = email.message_from_bytes(raw)
-    _, addr = parseaddr(msg.get("From", ""))
-    return addr
-
-
 def _run_processor(raw: bytes, processor_bin: str) -> bool:
     """Pipe raw RFC 2822 bytes to the processor. Returns True on success."""
-    sender = _extract_sender(raw)
+    child_env = dict(os.environ)
+    child_env["QRMAIL_SENDER_SOURCE"] = "gmail-headers"
     result = subprocess.run(
-        [processor_bin, sender], input=raw, capture_output=True,
+        [processor_bin], input=raw, capture_output=True, env=child_env,
     )
     if result.stderr:
         # Processor logs to stderr; relay at debug level to avoid double-logging.

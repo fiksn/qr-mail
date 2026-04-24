@@ -47,6 +47,8 @@ let
     export SMTP_USER=${lib.escapeShellArg cfg.smtpUser}
     export SMTP_PASSWORD=${lib.escapeShellArg cfg.smtpPassword}
     export SMTP_TLS=${lib.escapeShellArg cfg.smtpTls}
+    export SMTP_INSECURE_SKIP_VERIFY=${lib.boolToString cfg.smtpInsecureSkipVerify}
+    export ESLOG_TRUSTED_CERTS_FILE=${lib.escapeShellArg cfg.eslogTrustedCertsFile}
     exec ${python}/bin/python3 ${src}/scripts/mail_processor.py "$@"
   '';
   gmailFetcherBin = pkgs.writeShellScriptBin "qr-mail-gmail-fetch" ''
@@ -229,6 +231,28 @@ in
         - <literal>starttls</literal>: STARTTLS upgrade on connect (default, port 587)
         - <literal>tls</literal>: implicit TLS / SMTPS (port 465)
         - <literal>none</literal>: plain SMTP, no encryption
+      '';
+    };
+
+    smtpInsecureSkipVerify = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Disable SMTP certificate and hostname verification.
+
+        This weakens transport security and should only be used for broken
+        internal SMTP servers that cannot be fixed properly.
+      '';
+    };
+
+    eslogTrustedCertsFile = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      example = "/etc/ssl/certs/eslog-extra-trust.pem";
+      description = ''
+        Optional PEM bundle of additional trust anchors for eSLOG XML
+        signature verification. System trust roots are always used as the
+        baseline; this file lets you add private or missing CAs.
       '';
     };
 

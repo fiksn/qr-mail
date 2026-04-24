@@ -26,6 +26,9 @@ Configuration via environment variables:
   SMTP_USER              SMTP username for auth (optional)
   SMTP_PASSWORD          SMTP password for auth (optional)
   SMTP_TLS               TLS mode: starttls (default), tls (implicit/SMTPS), or none
+  SMTP_INSECURE_SKIP_VERIFY
+                         when "true", disable SMTP certificate and hostname
+                         verification (discouraged; default: false)
   GMAIL_SERVICE_ACCOUNT_FILE
                          when set together with GMAIL_IMPERSONATE_ADDRESS, send
                          outbound mail via Gmail API instead of sendmail/SMTP
@@ -53,8 +56,10 @@ import io
 import hashlib
 import logging
 import os
+import re
 import signal
 import smtplib
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -104,6 +109,8 @@ DEFAULT_PDF_RENDER_TIMEOUT_S = 20
 DEFAULT_MAX_IMAGE_PIXELS = 40_000_000
 DEFAULT_MAX_MESSAGE_RUNTIME_S = 60
 DEFAULT_PDFINFO_TIMEOUT_S = 3
+_AUTH_PASS_RE = re.compile(r"(?<![\w-])([a-z]+)=pass(?:[\s;(]|$)", re.IGNORECASE)
+_AUTH_PARAM_RE = re.compile(r"([A-Za-z0-9_.-]+)=([^;\s]+)")
 
 
 @dataclass
@@ -171,6 +178,94 @@ def load_config() -> tuple[str, str, list[str], list[str], list[str], int]:
         trusted,
         int(os.environ.get("MAX_ATTACHMENT_BYTES", DEFAULT_MAX_ATTACHMENT_BYTES)),
     )
+
+
+def _email_domain(addr: str) -> str:
+    if addr.count("@") != 1:
+        return ""
+    return addr.rsplit("@", 1)[1].lower()
+
+
+def _auth_method_passed(header_value: str, method: str) -> bool:
+    for matched_method in _AUTH_PASS_RE.findall(header_value):
+        if matched_method.lower() == method.lower():
+            return True
+    return False
+
+
+def _auth_param_values(header_value: str, key: str) -> list[str]:
+    values: list[str] = []
+    needle = key.lower()
+    for param_key, param_value in _AUTH_PARAM_RE.findall(header_value):
+        if param_key.lower() == needle:
+            values.append(param_value.strip())
+    return values
+
+
+def _normalize_auth_identity(raw: str) -> str:
+    value = raw.strip().strip("<>").strip().lower()
+    if not value:
+        return ""
+    if value.startswith("@"):
+        return value
+    _, addr = parseaddr(value)
+    return addr.lower() if addr else value
+
+
+def _derive_verified_gmail_sender(msg: email.message.Message) -> str:
+    """Return the RFC 2822 From address only if Gmail auth results align with it."""
+    _, from_addr = parseaddr(msg.get("From", ""))
+    from_addr = from_addr.strip().lower()
+    from_domain = _email_domain(from_addr)
+    if not from_addr or not from_domain:
+        return ""
+
+    auth_headers = (msg.get_all("Authentication-Results", []) or []) + (
+        msg.get_all("ARC-Authentication-Results", []) or []
+    )
+    if not auth_headers:
+        log.warning("Gmail message lacks Authentication-Results headers")
+        return ""
+
+    exact_match = False
+    aligned_domain_pass = False
+    for header_value in auth_headers:
+        if _auth_method_passed(header_value, "dmarc"):
+            for header_from in _auth_param_values(header_value, "header.from"):
+                if _normalize_auth_identity(header_from).lstrip("@") == from_domain:
+                    aligned_domain_pass = True
+
+        if _auth_method_passed(header_value, "spf"):
+            for mailfrom in _auth_param_values(header_value, "smtp.mailfrom"):
+                identity = _normalize_auth_identity(mailfrom)
+                if not identity:
+                    continue
+                if _email_domain(identity) == from_domain:
+                    aligned_domain_pass = True
+                if identity == from_addr:
+                    exact_match = True
+
+        if _auth_method_passed(header_value, "dkim"):
+            for header_i in _auth_param_values(header_value, "header.i"):
+                identity = _normalize_auth_identity(header_i)
+                if not identity:
+                    continue
+                if identity.startswith("@"):
+                    if identity[1:] == from_domain:
+                        aligned_domain_pass = True
+                elif _email_domain(identity) == from_domain:
+                    aligned_domain_pass = True
+                    if identity == from_addr:
+                        exact_match = True
+            for header_d in _auth_param_values(header_value, "header.d"):
+                if _normalize_auth_identity(header_d).lstrip("@") == from_domain:
+                    aligned_domain_pass = True
+
+    if exact_match or aligned_domain_pass:
+        return from_addr
+
+    log.warning("Gmail From address %r is not backed by aligned SPF/DKIM/DMARC pass", from_addr)
+    return ""
 
 
 def _decode_qr_bytes(data: bytes) -> str:
@@ -705,6 +800,12 @@ def _build_payment_text_block(payment: PaymentItem) -> list[str]:
             lines.append(f"    Valid:   {sig.signer.not_before} — {sig.signer.not_after}")
             if sig.signer.signing_time:
                 lines.append(f"    Signed:  {sig.signer.signing_time}")
+            if sig.chain:
+                lines.append("    Chain:")
+                for idx, cert in enumerate(sig.chain, start=1):
+                    lines.append(f"      {idx}. Subject: {cert.subject}")
+                    lines.append(f"         Issuer:  {cert.issuer}")
+                    lines.append(f"         Valid:   {cert.not_before} — {cert.not_after}")
         elif sig.valid is None:
             lines.append(f"  eSLOG signature: COULD NOT VERIFY ({sig.error})")
 
@@ -912,6 +1013,19 @@ def _load_smtp_config() -> Optional[SmtpConfig]:
     )
 
 
+def _smtp_skip_verify() -> bool:
+    return os.environ.get("SMTP_INSECURE_SKIP_VERIFY", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _build_smtp_tls_context() -> ssl.SSLContext:
+    if _smtp_skip_verify():
+        log.warning("SMTP TLS certificate verification is DISABLED")
+        return ssl._create_unverified_context()
+    return ssl.create_default_context()
+
+
 def _load_gmail_config() -> Optional[GmailConfig]:
     service_account_file = os.environ.get("GMAIL_SERVICE_ACCOUNT_FILE", "").strip()
     impersonate_address = os.environ.get("GMAIL_IMPERSONATE_ADDRESS", "").strip()
@@ -964,14 +1078,17 @@ def _send_mail(
         return
 
     log.debug("SMTP: connecting to %s:%d (tls=%s)", smtp_cfg.host, smtp_cfg.port, smtp_cfg.tls)
+    tls_context = _build_smtp_tls_context() if smtp_cfg.tls != "none" else None
     if smtp_cfg.tls == "tls":
-        conn: smtplib.SMTP = smtplib.SMTP_SSL(smtp_cfg.host, smtp_cfg.port)
+        conn: smtplib.SMTP = smtplib.SMTP_SSL(
+            smtp_cfg.host, smtp_cfg.port, context=tls_context,
+        )
     else:
         conn = smtplib.SMTP(smtp_cfg.host, smtp_cfg.port)
 
     with conn:
         if smtp_cfg.tls == "starttls":
-            conn.starttls()
+            conn.starttls(context=tls_context)
         if smtp_cfg.user:
             conn.login(smtp_cfg.user, smtp_cfg.password)
         conn.sendmail(my_address, recipients, msg_bytes)
@@ -997,9 +1114,16 @@ def main() -> None:
     # Prefer envelope sender (argv[1], set by Postfix ${sender}) over the
     # RFC 2822 From header, which is trivially spoofable.
     envelope_sender = sys.argv[1].strip() if len(sys.argv) > 1 else ""
+    sender_source = os.environ.get("QRMAIL_SENDER_SOURCE", "").strip().lower()
     if envelope_sender:
         sender_addr = envelope_sender
         log.debug("Using envelope sender: %s", sender_addr)
+    elif sender_source == "gmail-headers":
+        sender_addr = _derive_verified_gmail_sender(msg)
+        if sender_addr:
+            log.debug("Using Gmail-verified sender: %s", sender_addr)
+        else:
+            log.warning("No verified Gmail sender identity; discarding message")
     else:
         _, sender_addr = parseaddr(msg.get("From", ""))
         log.debug("No envelope sender; falling back to From header: %s", sender_addr)
