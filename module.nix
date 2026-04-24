@@ -9,6 +9,8 @@ let
     ps.pdf2image # renders PDF pages via poppler
     ps.pytesseract # OCR via tesseract
     ps.segno # QR code generation with ECI support
+    ps.defusedxml # safe XML parsing (XXE / billion laughs)
+    ps.cryptography # X.509 cert parsing + RSA signature verification
     ps.google-api-python-client # Gmail API (gmail_fetch.py)
     ps.google-auth # service account credentials
   ]);
@@ -291,7 +293,7 @@ in
       args = [
         "flags=Rq"
         "user=qr-mail"
-        "argv=${processorBin}/bin/qr-mail-processor"
+        "argv=${processorBin}/bin/qr-mail-processor" "\${sender}"
       ];
     };
 

@@ -46,7 +46,7 @@ class TestPaymentPrecedence(unittest.TestCase):
         ):
             payments = _merge_payments_with_precedence(
                 text_upns=[(_upn(iban=iban, reference=reference, name="Text"), "email-body")],
-                eslog_upns=[(_upn(iban=iban, reference=reference, name="eSLOG"), "invoice.xml (eSLOG XML)")],
+                eslog_upns=[(_upn(iban=iban, reference=reference, name="eSLOG"), "invoice.xml (eSLOG XML)", None)],
                 qr_payments=[],
             )
 
@@ -86,7 +86,7 @@ class TestPaymentPrecedence(unittest.TestCase):
 
         payments = _merge_payments_with_precedence(
             text_upns=[],
-            eslog_upns=[(_upn(iban=iban, reference=reference, name="eSLOG"), "invoice.xml (eSLOG XML)")],
+            eslog_upns=[(_upn(iban=iban, reference=reference, name="eSLOG"), "invoice.xml (eSLOG XML)", None)],
             qr_payments=[qr_item],
         )
 

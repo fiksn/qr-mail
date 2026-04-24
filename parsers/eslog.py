@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal, InvalidOperation
-import xml.etree.ElementTree as ET
+import defusedxml.ElementTree as ET
 
 from core.epc import EPCParseError, _validate_iban
 from core.upn import UPN

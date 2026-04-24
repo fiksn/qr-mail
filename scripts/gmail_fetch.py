@@ -18,11 +18,13 @@ All ADMIN_EMAIL / MY_ADDRESS / ALLOWED_SENDERS etc. must be set in the
 processor's own environment (the NixOS module handles this via its shell wrapper).
 """
 import base64
+import email
 import logging
 import os
 import subprocess
 import sys
 import time
+from email.utils import parseaddr
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -91,9 +93,19 @@ def _mark_processed(service, msg_id: str, processed_label_id: str) -> None:
     ).execute()
 
 
+def _extract_sender(raw: bytes) -> str:
+    """Extract the From address from raw RFC 2822 bytes."""
+    msg = email.message_from_bytes(raw)
+    _, addr = parseaddr(msg.get("From", ""))
+    return addr
+
+
 def _run_processor(raw: bytes, processor_bin: str) -> bool:
     """Pipe raw RFC 2822 bytes to the processor. Returns True on success."""
-    result = subprocess.run([processor_bin], input=raw, capture_output=True)
+    sender = _extract_sender(raw)
+    result = subprocess.run(
+        [processor_bin, sender], input=raw, capture_output=True,
+    )
     if result.stderr:
         # Processor logs to stderr; relay at debug level to avoid double-logging.
         for line in result.stderr.decode(errors="replace").splitlines():

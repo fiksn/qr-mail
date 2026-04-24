@@ -57,9 +57,12 @@ python3 scripts/generate_qr.py --format both        # UPN + EPC QR PNGs
 python3 scripts/generate_qr.py --format slip        # full UPN poloznica PNG (pink form + QR)
 python3 scripts/generate_qr.py --format all         # UPN + EPC + poloznica
 python3 scripts/generate_qr.py --format slip --slip-template ./UPN-1.jpg
+python3 scripts/verify_and_extract_eslog.py invoice.xml          # verify signature, print UPN fields
+python3 scripts/verify_and_extract_eslog.py invoice.xml \
+  | python3 scripts/generate_qr.py --format slip                 # verify + generate UPN slip
 python3 scripts/debug_process.py invoice.pdf --output out.eml
 ADMIN_EMAIL=admin@example.com MY_ADDRESS=qr@example.com ALLOWED_SENDERS='*@example.com' \
-  python3 scripts/mail_processor.py < message.eml
+  python3 scripts/mail_processor.py [envelope-sender] < message.eml
 ```
 
 Note: `--format slip` / `--format all` needs Pillow (`pip install pillow`).

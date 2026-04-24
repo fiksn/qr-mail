@@ -48,6 +48,10 @@ def parse_allowed_sender_routes(specs: list[str]) -> list[SenderRoute]:
 
 
 def matches(addr: str, pattern: str) -> bool:
+    # Reject addresses with multiple '@' signs — fnmatch's '*' glob
+    # matches '@', so "x@evil.com@trusted.com" would match "*@trusted.com".
+    if addr.count("@") != 1:
+        return False
     return fnmatch.fnmatch(addr.lower(), pattern.lower())
 
 

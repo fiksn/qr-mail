@@ -31,12 +31,17 @@ Configuration via environment variables:
                          outbound mail via Gmail API instead of sendmail/SMTP
   GMAIL_IMPERSONATE_ADDRESS
                          Google Workspace mailbox to impersonate for Gmail API send
+  MAX_MESSAGE_BYTES      max raw message size to read from stdin (default: 157286400 = 150 MB)
 
 Standalone usage:
   ADMIN_EMAIL=admin@example.com \
   MY_ADDRESS=test@example.com \
   ALLOWED_SENDERS="*@trusted.com:alice@*" \
-  python3 scripts/mail_processor.py < message.eml
+  python3 scripts/mail_processor.py [envelope-sender] < message.eml
+
+When called from Postfix pipe transport, pass the envelope sender as the
+first argument (${sender} in master.cf).  If omitted, the RFC 2822 From
+header is used (less secure — the From header is trivially spoofable).
 """
 from __future__ import annotations
 
@@ -75,6 +80,7 @@ from core.routing import (
 )
 from core.upn import UPN, UPNParseError, UPNReferenceError, format_upn, parse_upn, validate_upn_reference
 from parsers.eslog import ESlogParseError, parse_eslog_invoice
+from parsers.xmldsig import SignatureResult, verify_eslog_signature
 from parsers.text_extract import (
     build_upn_from_text,
     extract_image_text_from_bytes,
@@ -89,6 +95,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+DEFAULT_MAX_MESSAGE_BYTES = 150 * 1024 * 1024  # 150 MB
 DEFAULT_MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024  # 100 MB
 DEFAULT_MAX_PDF_PAGES = 10
 DEFAULT_PDF_RENDER_DPI = 200
@@ -137,6 +144,7 @@ class PaymentItem:
 
     conversion_error: Optional[str] = None
     reference_errors: list[str] = field(default_factory=list)
+    signature: Optional[SignatureResult] = None
 
 
 def load_config() -> tuple[str, str, list[str], list[str], list[str], int]:
@@ -475,7 +483,7 @@ def _payment_dedup_key(payment: PaymentItem) -> Optional[tuple[str, str]]:
 
 def _merge_payments_with_precedence(
     text_upns: list[tuple[UPN, str]],
-    eslog_upns: list[tuple[UPN, str]],
+    eslog_upns: list[tuple[UPN, str, Optional[SignatureResult]]],
     qr_payments: list[PaymentItem],
 ) -> list[PaymentItem]:
     """Merge payments by key with precedence: text < eSLOG XML < QR."""
@@ -494,8 +502,10 @@ def _merge_payments_with_precedence(
     for upn, source in text_upns:
         add(_build_upn_payment(upn, sources=[source], note_prefix="Text-extracted"), rank=1)
 
-    for upn, source in eslog_upns:
-        add(_build_upn_payment(upn, sources=[source], note_prefix="eSLOG XML"), rank=2)
+    for upn, source, sig in eslog_upns:
+        p = _build_upn_payment(upn, sources=[source], note_prefix="eSLOG XML")
+        p.signature = sig
+        add(p, rank=2)
 
     for payment in qr_payments:
         add(payment, rank=3)
@@ -562,9 +572,13 @@ def scan_text_for_payments(
 def scan_eslog_xml_for_payments(
     msg: email.message.Message,
     max_bytes: int,
-) -> list[tuple[UPN, str]]:
-    """Extract UPN candidates from supported eSLOG XML attachments."""
-    results: list[tuple[UPN, str]] = []
+) -> list[tuple[UPN, str, Optional[SignatureResult]]]:
+    """Extract UPN candidates from supported eSLOG XML attachments.
+
+    Returns (upn, source_label, signature_result) tuples.
+    Rejects (skips) XML attachments with invalid signatures.
+    """
+    results: list[tuple[UPN, str, Optional[SignatureResult]]] = []
     seen: set[tuple[str, str]] = set()
 
     for part in msg.walk():
@@ -590,11 +604,25 @@ def scan_eslog_xml_for_payments(
             log.warning("Failed to parse XML attachment %r: %s", filename, exc)
             continue
 
+        sig = verify_eslog_signature(payload)
+        if sig.valid is False:
+            log.warning(
+                "Rejecting eSLOG %r: invalid signature (%s)",
+                filename, sig.error,
+            )
+            continue
+
+        if not sig.signed:
+            log.info("eSLOG %r: unsigned document", filename)
+        elif sig.valid is True:
+            signer_cn = sig.signer.subject if sig.signer else "?"
+            log.info("eSLOG %r: valid signature (%s)", filename, signer_cn)
+
         key = (upn.recipient_iban, upn.recipient_reference)
         if key in seen:
             continue
         seen.add(key)
-        results.append((upn, f"{filename} (eSLOG XML)"))
+        results.append((upn, f"{filename} (eSLOG XML)", sig))
 
     return results
 
@@ -663,6 +691,22 @@ def _build_payment_text_block(payment: PaymentItem) -> list[str]:
         lines += ["  UPN slip: see inline preview (if supported) and attachment"]
     elif payment.kind == "upn":
         lines += ["  UPN slip: NOT GENERATED"]
+
+    # Signature info — only present for eSLOG XML sources.
+    if payment.signature is not None:
+        sig = payment.signature
+        lines.append("")
+        if not sig.signed:
+            lines.append("  eSLOG signature: UNSIGNED")
+        elif sig.valid is True and sig.signer:
+            lines.append("  eSLOG signature: VALID")
+            lines.append(f"    Signer:  {sig.signer.subject}")
+            lines.append(f"    Issuer:  {sig.signer.issuer}")
+            lines.append(f"    Valid:   {sig.signer.not_before} — {sig.signer.not_after}")
+            if sig.signer.signing_time:
+                lines.append(f"    Signed:  {sig.signer.signing_time}")
+        elif sig.valid is None:
+            lines.append(f"  eSLOG signature: COULD NOT VERIFY ({sig.error})")
 
     return lines
 
@@ -943,10 +987,22 @@ def main() -> None:
         print(f"ERROR: invalid ALLOWED_SENDER_ROUTES: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    raw = sys.stdin.buffer.read()
+    max_msg_bytes = int(os.environ.get("MAX_MESSAGE_BYTES", DEFAULT_MAX_MESSAGE_BYTES))
+    raw = sys.stdin.buffer.read(max_msg_bytes + 1)
+    if len(raw) > max_msg_bytes:
+        log.error("Message exceeds %d byte limit; discarding", max_msg_bytes)
+        sys.exit(1)
     msg = email.message_from_bytes(raw)
 
-    _, sender_addr = parseaddr(msg.get("From", ""))
+    # Prefer envelope sender (argv[1], set by Postfix ${sender}) over the
+    # RFC 2822 From header, which is trivially spoofable.
+    envelope_sender = sys.argv[1].strip() if len(sys.argv) > 1 else ""
+    if envelope_sender:
+        sender_addr = envelope_sender
+        log.debug("Using envelope sender: %s", sender_addr)
+    else:
+        _, sender_addr = parseaddr(msg.get("From", ""))
+        log.debug("No envelope sender; falling back to From header: %s", sender_addr)
     is_trusted = bool(sender_addr) and any(matches(sender_addr, p) for p in trusted_senders)
     route = find_route(sender_addr, routes) if sender_addr else None
     allowed = bool(sender_addr) and (is_allowed_sender(sender_addr, allowed_patterns) or route is not None)

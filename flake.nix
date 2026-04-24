@@ -21,6 +21,8 @@
               ps.pdf2image # PDF → image via poppler
               ps.pytesseract # OCR via tesseract
               ps.segno # QR code generation
+              ps.defusedxml # safe XML parsing (XXE / billion laughs)
+              ps.cryptography # X.509 cert parsing + RSA signature verification
               ps.pytest # test runner
               ps.google-api-python-client # Gmail API
               ps.google-auth # service account credentials
