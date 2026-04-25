@@ -6,6 +6,7 @@ Usage:
   python3 scripts/generate_qr.py --output invoice_123   # filename prefix for saved PNGs
 """
 import argparse
+import glob
 import io
 import os
 import sys
@@ -24,12 +25,28 @@ from core.generate import (
     upn_to_epc,
     upn_to_string,
 )
-from core.upn import UPN, UPNReferenceError, validate_upn_reference
+from core.upn import (
+    UPN,
+    UPNLegacyOCRError,
+    UPNReferenceError,
+    format_legacy_upn_ocr,
+    validate_upn_reference,
+)
 
 DEFAULT_SLIP_TEMPLATE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "upn_base_empty.jpg",
 )
+DEFAULT_LEGACY_SLIP_TEMPLATE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "upn_base_legacy_ocr.jpg",
+)
+DEFAULT_OCRB_FONT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "ocrb.ttf",
+)
+PAYER_FILE_ENV = "QR_MAIL_PAYER_FILE"
+PAYEE_FILE_ENV = "QR_MAIL_PAYEE_FILE"
 
 
 def _render_qr_ascii(
@@ -185,6 +202,42 @@ def ask_iban() -> str:
         return raw
 
 
+def load_party_defaults_from_env(env_var: str) -> tuple[str, str, str]:
+    """Load name/street/city defaults from a file path in the environment.
+
+    Expected file format is exactly three non-empty lines:
+      1. name
+      2. street
+      3. city
+
+    Any missing env var, unreadable file, or invalid content is ignored.
+    """
+    path = os.environ.get(env_var, "").strip()
+    if not path:
+        return "", "", ""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = [line.strip() for line in f.readlines()]
+    except OSError:
+        return "", "", ""
+
+    if len(lines) < 3:
+        return "", "", ""
+
+    name, street, city = lines[:3]
+    if not name or not street or not city:
+        return "", "", ""
+    return name[:33], street[:33], city[:33]
+
+
+def load_payer_defaults_from_env() -> tuple[str, str, str]:
+    return load_party_defaults_from_env(PAYER_FILE_ENV)
+
+
+def load_payee_defaults_from_env() -> tuple[str, str, str]:
+    return load_party_defaults_from_env(PAYEE_FILE_ENV)
+
+
 def _load_font(size: int, *, bold: bool = False) -> Any:
     from PIL import ImageFont
 
@@ -210,6 +263,51 @@ def _load_font(size: int, *, bold: bool = False) -> Any:
             return ImageFont.truetype(face, size=size)
         except OSError:
             continue
+    return ImageFont.load_default()
+
+
+def _load_ocr_font(size: int) -> Any:
+    from PIL import ImageFont
+
+    if os.path.exists(DEFAULT_OCRB_FONT):
+        try:
+            return ImageFont.truetype(DEFAULT_OCRB_FONT, size=size)
+        except OSError:
+            pass
+
+    faces = [
+        "OCRB Regular.ttf",
+        "OCR B Std.otf",
+        "OCR A Extended.ttf",
+        "OCRAEXT.TTF",
+    ]
+    for face in faces:
+        try:
+            return ImageFont.truetype(face, size=size)
+        except OSError:
+            continue
+
+    search_roots = [
+        "/nix/store/*/share/fonts/truetype",
+        "/nix/store/*/share/fonts/opentype",
+        "/usr/share/fonts",
+        "/usr/local/share/fonts",
+        os.path.expanduser("~/.fonts"),
+    ]
+    preferred_faces = [
+        "DejaVuSansMono-Bold.ttf",
+        "DejaVuSansMono.ttf",
+        "LiberationMono-Bold.ttf",
+        "LiberationMono-Regular.ttf",
+        "DejaVuSans.ttf",
+    ]
+    for root in search_roots:
+        for face in preferred_faces:
+            for path in glob.glob(os.path.join(root, "**", face), recursive=True):
+                try:
+                    return ImageFont.truetype(path, size=size)
+                except OSError:
+                    continue
     return ImageFont.load_default()
 
 
@@ -241,6 +339,7 @@ def _draw_in_box(
     fill: str = "#202020",
     align: str = "left",
     multiline: bool = False,
+    line_gap: Optional[float] = None,
 ) -> None:
     x1, y1, x2, y2 = box
     max_width = max(1, (x2 - x1) - 8)
@@ -264,6 +363,18 @@ def _draw_in_box(
                     candidate = candidate[:cut]
                 lines.append(candidate)
                 remaining = remaining[len(candidate):].strip()
+        if line_gap is not None:
+            start_y = y1 + 4 + line_gap / 2
+            for idx, line in enumerate(lines[:3]):
+                if not line:
+                    continue
+                anchor_y = start_y + idx * line_gap
+                if align == "right":
+                    draw.text((x2 - 4, anchor_y), line, font=font, fill=fill, anchor="rm")
+                else:
+                    draw.text((x1 + 4, anchor_y), line, font=font, fill=fill, anchor="lm")
+            return
+
         slot_h = max(1.0, (y2 - y1 - 8) / 3.0)
         for idx, line in enumerate(lines[:3]):
             if not line:
@@ -359,6 +470,138 @@ def _draw_amount_boxed(
     comma_boundary = cells - 2
     comma_x = int(x1 + comma_boundary * cell_w)
     draw.text((comma_x, cy + 1), ",", font=font, fill=fill, anchor="mm")
+
+
+def _create_legacy_slip_template() -> Any:
+    from PIL import Image, ImageDraw
+
+    width, height = 930, 480
+    img = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(img)
+
+    orange = "#F28C28"
+    pale_top = "#FCE6D7"
+    pale_bottom = "#FFF2CC"
+    line = "#303030"
+
+    draw.rectangle((18, 18, 912, 452), outline=line, width=2)
+    draw.line((280, 18, 280, 452), fill=line, width=2)
+    draw.line((280, 168, 912, 168), fill=orange, width=2)
+    draw.line((280, 374, 912, 374), fill=orange, width=2)
+    draw.line((18, 390, 912, 390), fill=line, width=2)
+
+    draw.rectangle((281, 19, 911, 167), fill=pale_top)
+    draw.rectangle((281, 169, 911, 373), fill=pale_bottom)
+
+    label = _load_font(13, bold=True)
+
+    def box(coords: tuple[int, int, int, int], text: str = "") -> None:
+        draw.rectangle(coords, outline=orange, width=2)
+        if text:
+            draw.text((coords[0] + 4, coords[1] - 16), text, font=label, fill=orange)
+
+    draw.text((32, 26), "UPN", font=_load_font(26, bold=True), fill=line)
+    box((28, 54, 264, 110), "Ime placnika")
+    box((28, 132, 264, 198), "Namen / rok placila")
+    box((106, 220, 264, 252), "Znesek")
+    draw.text((58, 222), "EUR", font=_load_font(20, bold=True), fill=line)
+    box((28, 274, 264, 346), "IBAN prejemnika")
+    box((28, 366, 264, 396), "Referenca prejemnika")
+    box((28, 414, 264, 448), "Ime prejemnika")
+
+    box((325, 28, 654, 58), "IBAN")
+    box((325, 76, 654, 106), "Referenca")
+    box((325, 124, 735, 186), "Ime in naslov")
+    box((764, 28, 812, 58), "Polog")
+    box((836, 28, 884, 58), "Dvig")
+    box((744, 124, 902, 186), "Podpis placnika")
+    box((302, 202, 362, 232), "Koda namena")
+    box((374, 202, 748, 232), "Namen / rok placila")
+    box((770, 202, 892, 232), "Nujno")
+    box((374, 246, 526, 278), "Znesek")
+    box((540, 246, 690, 278), "Datum placila")
+    box((710, 246, 892, 278), "BIC banke prejemnika")
+    box((302, 296, 892, 328), "IBAN")
+    box((302, 344, 714, 374), "Referenca")
+    box((302, 396, 856, 440), "Ime in naslov")
+
+    draw.text((333, 362), "UPN - legacy OCR", font=_load_font(16, bold=True), fill=line)
+    draw.text((331, 404), "Prostor za vpise bank", font=_load_font(12, bold=False), fill=orange)
+    draw.text((318, 410), "______________________________________________", font=_load_font(12, bold=False), fill=orange)
+    draw.text((314, 408), "Prostor za vpise bank", font=_load_font(12, bold=False), fill=orange)
+    draw.text((338, 414), "in opticni zapis podatkov (OCR)", font=_load_font(12, bold=False), fill=orange)
+    return img
+
+
+def _draw_mark(draw: Any, box: tuple[int, int, int, int], *, fill: str = "#1A1A1A") -> None:
+    x1, y1, x2, y2 = box
+    draw.line((x1 + 4, y1 + 4, x2 - 4, y2 - 4), fill=fill, width=3)
+    draw.line((x2 - 4, y1 + 4, x1 + 4, y2 - 4), fill=fill, width=3)
+
+
+def generate_legacy_upn_slip_png(
+    upn: UPN,
+    *,
+    template_path: Optional[str] = None,
+) -> bytes:
+    """Render a legacy UPN slip with the OCR payload line at the bottom."""
+    from PIL import Image, ImageDraw
+
+    source = template_path or DEFAULT_LEGACY_SLIP_TEMPLATE
+    if os.path.exists(source):
+        img = Image.open(source).convert("RGB")
+    else:
+        img = _create_legacy_slip_template()
+    draw = ImageDraw.Draw(img)
+
+    font_small = _load_font(11, bold=True)
+    font_main = _load_font(14, bold=True)
+    font_boxed = _load_font(12, bold=True)
+    font_amount = _load_font(16, bold=True)
+    font_ocr = _load_ocr_font(23)
+
+    amount_text = _format_eur_for_slip(upn.amount_cents)
+    payment_date = upn.payment_date.strftime("%d.%m.%Y") if upn.payment_date else ""
+    deadline = upn.payment_deadline.strftime("%d.%m.%Y") if upn.payment_deadline else ""
+    payer_full = "\n".join(v for v in [upn.payer_name, upn.payer_street, upn.payer_city] if v)
+    recipient_full = "\n".join(v for v in [upn.recipient_name, upn.recipient_street, upn.recipient_city] if v)
+    purpose_full = "\n".join(v for v in [upn.payment_purpose, f"Rok placila {deadline}" if deadline else ""] if v)
+
+    legacy_ocr_text = format_legacy_upn_ocr(upn)
+    payer_iban_box = upn.payer_iban.replace(" ", "")
+    payer_ref_box = _reference_for_boxes(upn.payer_reference)
+    recipient_iban_box = upn.recipient_iban.replace(" ", "")
+    recipient_ref_box = _reference_for_boxes(upn.recipient_reference)
+
+    _draw_in_box(draw, box=(12, 30, 223, 95), text=payer_full, font=font_small, multiline=True, line_gap=12)
+    _draw_in_box(draw, box=(12, 92, 223, 136), text=purpose_full, font=font_small, multiline=True, line_gap=11)
+    _draw_in_box(draw, box=(122, 130, 223, 149), text=amount_text, font=font_main)
+    _draw_in_box(draw, box=(12, 173, 223, 235), text=upn.recipient_iban, font=font_small, multiline=True)
+    _draw_in_box(draw, box=(12, 237, 223, 257), text=upn.recipient_reference, font=font_small)
+    _draw_in_box(draw, box=(12, 260, 223, 319), text=recipient_full, font=font_small, multiline=True, line_gap=12)
+
+    _draw_boxed_chars(draw, box=(246, 4, 528, 26), text=payer_iban_box, cells=21, font=font_boxed, align="left")
+    _draw_boxed_chars(draw, box=(246, 38, 632, 60), text=payer_ref_box, cells=26, font=font_boxed, align="left")
+    _draw_in_box(draw, box=(246, 73, 640, 121), text=payer_full, font=font_small, multiline=True)
+    _draw_boxed_chars(draw, box=(246, 129, 502, 151), text=upn.payment_purpose, cells=24, font=font_small, align="left", x_shift=1.0)
+    _draw_amount_boxed(draw, box=(296, 160, 456, 183), amount_cents=upn.amount_cents, cells=10, font=font_amount)
+    _draw_boxed_chars(draw, box=(470, 160, 590, 183), text=payment_date, cells=10, font=font_boxed, align="left")
+    _draw_boxed_chars(draw, box=(246, 191, 753, 212), text=recipient_iban_box, cells=34, font=font_boxed, align="left")
+    _draw_boxed_chars(draw, box=(246, 224, 767, 246), text=recipient_ref_box, cells=26, font=font_boxed, align="left")
+    _draw_in_box(draw, box=(246, 258, 726, 320), text=recipient_full, font=font_small, multiline=True, line_gap=12)
+
+    if upn.urgent:
+        _draw_mark(draw, (546, 8, 563, 27))
+    if upn.deposit:
+        _draw_mark(draw, (577, 8, 594, 27))
+    if upn.withdrawal:
+        _draw_mark(draw, (608, 8, 626, 27))
+
+    draw.text((246, 342), legacy_ocr_text, font=font_ocr, fill="#202020")
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 def generate_upn_slip_png(
@@ -496,14 +739,30 @@ def main() -> None:
                         help="filename prefix for saved PNGs (default: payment)")
     parser.add_argument(
         "--format",
-        choices=["upn", "epc", "both", "slip", "poloznica", "all", "upn_cli", "epc_cli"],
+        choices=[
+            "upn",
+            "epc",
+            "both",
+            "slip",
+            "poloznica",
+            "legacy_slip",
+            "all",
+            "upn_cli",
+            "epc_cli",
+            "legacy_ocr_cli",
+        ],
         default="both",
-        help="output mode: upn, epc, both, slip/poloznica, all, upn_cli, epc_cli (default: both)",
+        help="output mode: upn, epc, both, slip/poloznica, legacy_slip, all, upn_cli, epc_cli, legacy_ocr_cli (default: both)",
     )
     parser.add_argument(
         "--slip-template",
         default=DEFAULT_SLIP_TEMPLATE,
         help=f"path to empty UPN slip template image (default: {DEFAULT_SLIP_TEMPLATE})",
+    )
+    parser.add_argument(
+        "--legacy-slip-template",
+        default=DEFAULT_LEGACY_SLIP_TEMPLATE,
+        help=f"path to empty legacy UPN OCR slip template image (default: {DEFAULT_LEGACY_SLIP_TEMPLATE})",
     )
     args = parser.parse_args()
 
@@ -511,10 +770,11 @@ def main() -> None:
     print("─" * 40)
 
     print("Recipient (prejemnik)")
+    payee_name_default, payee_street_default, payee_city_default = load_payee_defaults_from_env()
     iban = ask_iban()
-    name = ask("Recipient name", required=True)
-    street = ask("Recipient street")
-    city = ask("Recipient city", required=True)
+    name = ask("Recipient name", default=payee_name_default, required=True)
+    street = ask("Recipient street", default=payee_street_default)
+    city = ask("Recipient city", default=payee_city_default, required=True)
     reference = ask_reference()
     amount_cents = ask_amount()
     payment_date = ask_date("Payment date", default_today=True)
@@ -524,11 +784,12 @@ def main() -> None:
 
     print()
     print("Payer (placnik) - optional")
+    payer_name_default, payer_street_default, payer_city_default = load_payer_defaults_from_env()
     payer_iban = ask_optional_iban("Payer IBAN")
     payer_reference = ask_reference_optional("Payer reference")
-    payer_name = ask("Payer name")
-    payer_street = ask("Payer street")
-    payer_city = ask("Payer city")
+    payer_name = ask("Payer name", default=payer_name_default)
+    payer_street = ask("Payer street", default=payer_street_default)
+    payer_city = ask("Payer city", default=payer_city_default)
     deposit = ask_bool("Polog")
     withdrawal = ask_bool("Dvig")
     urgent = ask_bool("Nujno")
@@ -546,8 +807,10 @@ def main() -> None:
     want_upn = args.format in ("upn", "both", "all")
     want_epc = args.format in ("epc", "both", "all")
     want_slip = args.format in ("slip", "poloznica", "all")
+    want_legacy_slip = args.format == "legacy_slip"
     want_upn_cli = args.format == "upn_cli"
     want_epc_cli = args.format == "epc_cli"
+    want_legacy_ocr_cli = args.format == "legacy_ocr_cli"
 
     prefix = args.output
 
@@ -576,6 +839,14 @@ def main() -> None:
             print("EPC QR (ASCII):")
             print(_render_qr_ascii(epc_to_string(epc), encoding="utf-8", error="m"))
 
+    if want_legacy_ocr_cli:
+        try:
+            print("Legacy UPN OCR payload:")
+            print(format_legacy_upn_ocr(upn))
+        except (UPNLegacyOCRError, UPNReferenceError) as exc:
+            print(f"Legacy OCR conversion failed: {exc}", file=sys.stderr)
+            sys.exit(1)
+
     if want_slip:
         try:
             slip_png = generate_upn_slip_png(upn, template_path=args.slip_template)
@@ -591,6 +862,25 @@ def main() -> None:
         with open(slip_path, "wb") as f:
             f.write(slip_png)
         print(f"UPN slip saved: {slip_path}")
+
+    if want_legacy_slip:
+        try:
+            legacy_slip_png = generate_legacy_upn_slip_png(
+                upn,
+                template_path=args.legacy_slip_template,
+            )
+        except ModuleNotFoundError as exc:
+            if exc.name == "PIL":
+                print("Legacy slip rendering requires Pillow: pip install pillow", file=sys.stderr)
+                sys.exit(1)
+            raise
+        except (FileNotFoundError, UPNLegacyOCRError, UPNReferenceError) as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(1)
+        legacy_slip_path = f"{prefix}_poloznica_ocr.png"
+        with open(legacy_slip_path, "wb") as f:
+            f.write(legacy_slip_png)
+        print(f"Legacy UPN OCR slip saved: {legacy_slip_path}")
 
 
 if __name__ == "__main__":

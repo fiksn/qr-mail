@@ -1,7 +1,7 @@
 import unittest
 
 from core.generate import upn_to_epc
-from core.upn import UPN
+from core.upn import UPN, UPNLegacyOCRError, format_legacy_upn_ocr
 
 
 class TestUPNToEPC(unittest.TestCase):
@@ -56,6 +56,20 @@ class TestUPNToEPC(unittest.TestCase):
         )
         self.assertEqual(epc.beneficiary_name, "PREJEMNIK")
         self.assertIsNone(epc.amount)
+
+    def test_format_legacy_upn_ocr_uses_expected_segments(self) -> None:
+        upn = self._upn(
+            recipient_reference="SI126604876475931",
+            amount_cents=5629,
+        )
+        self.assertEqual(
+            format_legacy_upn_ocr(upn),
+            "6604876475931 1234567892 000000005629 19200000 56",
+        )
+
+    def test_format_legacy_upn_ocr_requires_si12_reference(self) -> None:
+        with self.assertRaises(UPNLegacyOCRError):
+            format_legacy_upn_ocr(self._upn(recipient_reference="SI001234"))
 
 
 if __name__ == "__main__":

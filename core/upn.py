@@ -27,6 +27,10 @@ class UPNReferenceError(ValueError):
     """Raised when a UPN SI/RF reference is present but invalid."""
 
 
+class UPNLegacyOCRError(ValueError):
+    """Raised when a UPN cannot be represented as a legacy OCR line."""
+
+
 @dataclass(frozen=True)
 class UPN:
     """Parsed Slovenian UPN QR payment order (section 5.2)."""
@@ -161,6 +165,46 @@ def format_upn(upn: UPN) -> str:
         lines.append(f"  Flags: {', '.join(flags)}")
 
     return "\n".join(lines)
+
+
+def format_legacy_upn_ocr(upn: UPN) -> str:
+    """Format a best-effort legacy UPN OCR payload as plain ASCII.
+
+    The legacy OCR line contains only:
+    - recipient reference body (SI12 content only),
+    - recipient account digits 10-19 from the IBAN,
+    - zero-padded amount in cents,
+    - recipient bank code digits 5-9 from the IBAN, plus ``000``,
+    - constant ``56``.
+
+    The exact OCR-A1 delimiter/check glyph mapping is font-specific and is not
+    reproduced here; segments are joined with spaces for inspection/export.
+    """
+    ref = validate_upn_reference(upn.recipient_reference)
+    if not ref.startswith("SI12"):
+        raise UPNLegacyOCRError(
+            "legacy OCR requires recipient reference in SI12 format"
+        )
+
+    iban = upn.recipient_iban.replace(" ", "").upper()
+    if not re.fullmatch(r"SI\d{17}", iban):
+        raise UPNLegacyOCRError(
+            "legacy OCR requires a Slovenian recipient IBAN in SI56 format"
+        )
+
+    ref_digits = ref[4:]
+    if len(ref_digits) > 13:
+        raise UPNLegacyOCRError(
+            f"legacy OCR supports up to 13 reference digits, got {len(ref_digits)}"
+        )
+
+    if upn.amount_cents < 0:
+        raise UPNLegacyOCRError("legacy OCR does not support negative amounts")
+
+    account_digits = iban[9:19]
+    bank_code = iban[4:9] + "000"
+    amount_digits = f"{upn.amount_cents:012d}"
+    return " ".join((ref_digits, account_digits, amount_digits, bank_code, "56"))
 
 
 # ── Reference validation (SI / RF models) ─────────────────────────────────────

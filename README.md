@@ -63,7 +63,9 @@ Example:
 ```bash
 python3 scripts/generate_qr.py --format both        # UPN + EPC QR PNGs
 python3 scripts/generate_qr.py --format slip        # full UPN poloznica PNG (pink form + QR)
+python3 scripts/generate_qr.py --format legacy_slip # legacy UPN slip with bottom OCR line
 python3 scripts/generate_qr.py --format all         # UPN + EPC + poloznica
+python3 scripts/generate_qr.py --format legacy_ocr_cli
 python3 scripts/generate_qr.py --format slip --slip-template ./UPN-1.jpg
 python3 scripts/verify_and_extract_eslog.py invoice.xml          # verify signature, print UPN fields
 python3 scripts/verify_and_extract_eslog.py invoice.xml \
@@ -75,6 +77,7 @@ ADMIN_EMAIL=admin@example.com MY_ADDRESS=qr@example.com ALLOWED_SENDERS='*@examp
 
 Note: `--format slip` / `--format all` needs Pillow (`pip install pillow`).
 Default slip template path is `./upn_base_empty.jpg` (bundled in repo).
+Legacy OCR slip mode uses `./upn_base_legacy_ocr.jpg` by default and requires an OCR-compatible recipient reference (`SI12`).
 
 If you use the Nix dev shell, the same commands work via:
 ```bash
