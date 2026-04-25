@@ -45,6 +45,10 @@ DEFAULT_OCRB_FONT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "ocrb.ttf",
 )
+DEFAULT_PARTY_TEMPLATE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "janez_novak.txt",
+)
 PAYER_FILE_ENV = "QR_MAIL_PAYER_FILE"
 PAYEE_FILE_ENV = "QR_MAIL_PAYEE_FILE"
 
@@ -167,11 +171,12 @@ def ask_reference() -> str:
             print(f"  Invalid reference: {exc}")
 
 
-def ask_optional_iban(prompt: str) -> str:
+def ask_optional_iban(prompt: str, *, default: str = "") -> str:
     while True:
-        raw = input(f"{prompt} (blank = none): ").strip()
+        display = f"{prompt} (blank = none) [{default}]: " if default else f"{prompt} (blank = none): "
+        raw = input(display).strip()
         if not raw:
-            return ""
+            return default
         compact = raw.replace(" ", "").upper()
         if len(compact) < 15 or not compact[:2].isalpha() or not compact[2:].isdigit():
             print("  Doesn't look like a valid IBAN.")
@@ -190,9 +195,13 @@ def ask_reference_optional(prompt: str) -> str:
             print(f"  Invalid reference: {exc}")
 
 
-def ask_iban() -> str:
+def ask_iban(*, default: str = "") -> str:
+    display = f"IBAN (required) [{default}]: " if default else "IBAN (required): "
     while True:
-        raw = input("IBAN (required): ").strip().replace(" ", "").upper()
+        raw = input(display).strip()
+        if not raw:
+            raw = default
+        raw = raw.replace(" ", "").upper()
         if not raw:
             print("  (required)")
             continue
@@ -202,32 +211,48 @@ def ask_iban() -> str:
         return raw
 
 
-def load_party_defaults_from_env(env_var: str) -> tuple[str, str, str]:
-    """Load name/street/city defaults from a file path in the environment.
+def load_party_template_from_env(env_var: str) -> tuple[str, str, str, str]:
+    """Load IBAN/name/street/city defaults from a file path in the environment.
 
-    Expected file format is exactly three non-empty lines:
+    Expected file format is either:
+      1. IBAN
+      2. name
+      3. street
+      4. city
+
+    or the legacy format:
       1. name
       2. street
       3. city
 
     Any missing env var, unreadable file, or invalid content is ignored.
     """
-    path = os.environ.get(env_var, "").strip()
+    path = os.environ.get(env_var, "").strip() or DEFAULT_PARTY_TEMPLATE
     if not path:
-        return "", "", ""
+        return "", "", "", ""
     try:
         with open(path, "r", encoding="utf-8") as f:
-            lines = [line.strip() for line in f.readlines()]
+            lines = [line.rstrip("\n").strip() for line in f.readlines()]
     except OSError:
-        return "", "", ""
+        return "", "", "", ""
 
-    if len(lines) < 3:
-        return "", "", ""
+    if len(lines) >= 4:
+        iban, name, street, city = lines[:4]
+    elif len(lines) >= 3:
+        iban = ""
+        name, street, city = lines[:3]
+    else:
+        return "", "", "", ""
 
-    name, street, city = lines[:3]
     if not name or not street or not city:
-        return "", "", ""
-    return name[:33], street[:33], city[:33]
+        return "", "", "", ""
+    return iban[:34], name[:33], street[:33], city[:33]
+
+
+def load_party_defaults_from_env(env_var: str) -> tuple[str, str, str]:
+    """Load name/street/city defaults from a file path in the environment."""
+    _, name, street, city = load_party_template_from_env(env_var)
+    return name, street, city
 
 
 def load_payer_defaults_from_env() -> tuple[str, str, str]:
@@ -236,6 +261,14 @@ def load_payer_defaults_from_env() -> tuple[str, str, str]:
 
 def load_payee_defaults_from_env() -> tuple[str, str, str]:
     return load_party_defaults_from_env(PAYEE_FILE_ENV)
+
+
+def load_payer_template_from_env() -> tuple[str, str, str, str]:
+    return load_party_template_from_env(PAYER_FILE_ENV)
+
+
+def load_payee_template_from_env() -> tuple[str, str, str, str]:
+    return load_party_template_from_env(PAYEE_FILE_ENV)
 
 
 def _load_font(size: int, *, bold: bool = False) -> Any:
@@ -770,8 +803,8 @@ def main() -> None:
     print("─" * 40)
 
     print("Recipient (prejemnik)")
-    payee_name_default, payee_street_default, payee_city_default = load_payee_defaults_from_env()
-    iban = ask_iban()
+    payee_iban_default, payee_name_default, payee_street_default, payee_city_default = load_payee_template_from_env()
+    iban = ask_iban(default=payee_iban_default)
     name = ask("Recipient name", default=payee_name_default, required=True)
     street = ask("Recipient street", default=payee_street_default)
     city = ask("Recipient city", default=payee_city_default, required=True)
@@ -784,8 +817,8 @@ def main() -> None:
 
     print()
     print("Payer (placnik) - optional")
-    payer_name_default, payer_street_default, payer_city_default = load_payer_defaults_from_env()
-    payer_iban = ask_optional_iban("Payer IBAN")
+    payer_iban_default, payer_name_default, payer_street_default, payer_city_default = load_payer_template_from_env()
+    payer_iban = ask_optional_iban("Payer IBAN", default=payer_iban_default)
     payer_reference = ask_reference_optional("Payer reference")
     payer_name = ask("Payer name", default=payer_name_default)
     payer_street = ask("Payer street", default=payer_street_default)

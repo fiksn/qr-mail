@@ -11,44 +11,14 @@ from scripts.generate_qr import (
     generate_legacy_upn_slip_png,
     generate_upn_slip_png,
     load_payee_defaults_from_env,
+    load_payee_template_from_env,
     load_payer_defaults_from_env,
+    load_payer_template_from_env,
     load_party_defaults_from_env,
 )
 
 
-FIXTURES_DIR = Path(__file__).parent / "fixtures"
-
-
-def test_load_payer_defaults_from_env_uses_fixture(monkeypatch) -> None:
-    monkeypatch.setenv(
-        PAYER_FILE_ENV,
-        str(FIXTURES_DIR / "payer_janez_novak.txt"),
-    )
-
-    assert load_payer_defaults_from_env() == (
-        "Janez Novak",
-        "Celovska 137",
-        "1000 Ljubljana",
-    )
-
-
-def test_load_payee_defaults_from_env_uses_fixture(monkeypatch) -> None:
-    monkeypatch.setenv(
-        PAYEE_FILE_ENV,
-        str(FIXTURES_DIR / "payee_example_doo.txt"),
-    )
-
-    assert load_payee_defaults_from_env() == (
-        "Example d.o.o.",
-        "Dunajska cesta 10",
-        "1000 Ljubljana",
-    )
-
-
-def test_load_payer_defaults_from_env_ignores_missing_env(monkeypatch) -> None:
-    monkeypatch.delenv(PAYER_FILE_ENV, raising=False)
-
-    assert load_payer_defaults_from_env() == ("", "", "")
+REPO_DIR = Path(__file__).parent.parent
 
 
 def test_load_payer_defaults_from_env_ignores_bad_file(monkeypatch, tmp_path) -> None:
@@ -57,6 +27,30 @@ def test_load_payer_defaults_from_env_ignores_bad_file(monkeypatch, tmp_path) ->
     monkeypatch.setenv(PAYER_FILE_ENV, os.fspath(bad_file))
 
     assert load_payer_defaults_from_env() == ("", "", "")
+
+
+def test_load_payee_template_from_env_allows_blank_iban(monkeypatch, tmp_path) -> None:
+    payee_file = tmp_path / "example_doo.txt"
+    payee_file.write_text(
+        "\n"
+        "Example d.o.o.\n"
+        "Dunajska cesta 10\n"
+        "1000 Ljubljana\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(PAYEE_FILE_ENV, os.fspath(payee_file))
+
+    assert load_payee_template_from_env() == (
+        "",
+        "Example d.o.o.",
+        "Dunajska cesta 10",
+        "1000 Ljubljana",
+    )
+    assert load_payee_defaults_from_env() == (
+        "Example d.o.o.",
+        "Dunajska cesta 10",
+        "1000 Ljubljana",
+    )
 
 
 def test_load_party_defaults_from_env_truncates_fields(monkeypatch, tmp_path) -> None:
