@@ -22,6 +22,7 @@ let
     cp -r ${./parsers} $out/parsers
     cp -r ${./scripts} $out/scripts
     cp ${./upn_base_empty.jpg} $out/upn_base_empty.jpg
+    cp ${./slo-intermediates.pem} $out/slo-intermediates.pem
   '';
 
   # Liberation Mono ships glyphs for Slovene diacritics (š/č/ž); plain Pillow on
