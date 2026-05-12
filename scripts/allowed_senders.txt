@@ -1,0 +1,7 @@
+# Default sender allowlist for scripts/gmail_backfill.py.
+# One address per line. Lines starting with '#' are comments.
+# Glob patterns are accepted (e.g. *@vendor.example).
+eracuni@ece.si
+racuni@t-2.com
+noreply@gen-i.si
+clanstvo@amzs.si

@@ -211,8 +211,8 @@ def ask_iban(*, default: str = "") -> str:
         return raw
 
 
-def load_party_template_from_env(env_var: str) -> tuple[str, str, str, str]:
-    """Load IBAN/name/street/city defaults from a file path in the environment.
+def load_party_template_from_file(path: str) -> tuple[str, str, str, str]:
+    """Load IBAN/name/street/city from a file path.
 
     Expected file format is either:
       1. IBAN
@@ -225,9 +225,8 @@ def load_party_template_from_env(env_var: str) -> tuple[str, str, str, str]:
       2. street
       3. city
 
-    Any missing env var, unreadable file, or invalid content is ignored.
+    An unreadable or invalid file returns ('', '', '', '').
     """
-    path = os.environ.get(env_var, "").strip() or DEFAULT_PARTY_TEMPLATE
     if not path:
         return "", "", "", ""
     try:
@@ -247,6 +246,12 @@ def load_party_template_from_env(env_var: str) -> tuple[str, str, str, str]:
     if not name or not street or not city:
         return "", "", "", ""
     return iban[:34], name[:33], street[:33], city[:33]
+
+
+def load_party_template_from_env(env_var: str) -> tuple[str, str, str, str]:
+    """Load IBAN/name/street/city defaults from a file path in the environment."""
+    path = os.environ.get(env_var, "").strip() or DEFAULT_PARTY_TEMPLATE
+    return load_party_template_from_file(path)
 
 
 def load_party_defaults_from_env(env_var: str) -> tuple[str, str, str]:
@@ -273,6 +278,18 @@ def load_payee_template_from_env() -> tuple[str, str, str, str]:
 
 def _load_font(size: int, *, bold: bool = False) -> Any:
     from PIL import ImageFont
+
+    # Absolute path injected by the Nix wrapper. Pillow on NixOS cannot resolve
+    # bare font names, so without this it would fall back to the bitmap default
+    # which lacks Slovene diacritics (š/č/ž render as tofu).
+    env_path = os.environ.get(
+        "QR_MAIL_MONO_FONT_BOLD" if bold else "QR_MAIL_MONO_FONT_REGULAR", ""
+    ).strip()
+    if env_path:
+        try:
+            return ImageFont.truetype(env_path, size=size)
+        except OSError:
+            pass
 
     faces = (
         [

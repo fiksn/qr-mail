@@ -142,7 +142,7 @@ class TestOutboundTransport(unittest.TestCase):
             impersonate_address="qr@example.com",
         )
 
-        with mock.patch("scripts.mail_processor._send_mail_via_gmail_api") as gmail_send, \
+        with mock.patch("scripts.mail_processor.send_mail_via_gmail_api") as gmail_send, \
              mock.patch("scripts.mail_processor.smtplib.SMTP") as smtp_send, \
              mock.patch("scripts.mail_processor.subprocess.run") as sendmail_run:
             _send_mail(fwd, "qr@example.com", recipients, smtp_cfg, gmail_cfg)

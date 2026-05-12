@@ -1037,7 +1037,7 @@ def _load_gmail_config() -> Optional[GmailConfig]:
     )
 
 
-def _send_mail_via_gmail_api(
+def send_mail_via_gmail_api(
     fwd: MIMEMultipart,
     recipients: list[str],
     gmail_cfg: GmailConfig,
@@ -1059,6 +1059,47 @@ def _send_mail_via_gmail_api(
     log.debug("Gmail API: sent to %s", recipients)
 
 
+def scan_message_for_payments(
+    msg: email.message.Message,
+    *,
+    max_bytes: int = DEFAULT_MAX_ATTACHMENT_BYTES,
+    max_runtime_s: int = DEFAULT_MAX_MESSAGE_RUNTIME_S,
+) -> tuple[list[PaymentItem], list[str]]:
+    """Scan a parsed RFC 2822 message for UPN/EPC payment data.
+
+    Returns (payments, extra_warnings). extra_warnings carries a single
+    notice when the scan hits the time limit.
+    """
+    payments: list[PaymentItem] = []
+    extra_warnings: list[str] = []
+    if max_runtime_s > 0:
+        signal.signal(signal.SIGALRM, _alarm_handler)
+        signal.alarm(max_runtime_s)
+    try:
+        text_upns = scan_text_for_payments(msg, max_bytes)
+        log.info("Text-extracted payment candidates: %d", len(text_upns))
+        eslog_upns = scan_eslog_xml_for_payments(msg, max_bytes)
+        log.info("eSLOG XML payment candidates: %d", len(eslog_upns))
+        qr_results = scan_attachments(msg, max_bytes)
+        log.info("QR codes found (raw): %d", len(qr_results))
+        qr_unique = dedupe_qr_results(qr_results)
+        log.info("QR codes found (unique): %d", len(qr_unique))
+        qr_payments = find_payments(qr_unique)
+        log.info("Payment QR items: %d", len(qr_payments))
+        payments = _merge_payments_with_precedence(text_upns, eslog_upns, qr_payments)
+        log.info("Merged payment items: %d", len(payments))
+    except MessageProcessingTimeout as exc:
+        log.warning("Message processing timed out: %s", exc)
+        extra_warnings.append(
+            f"Processing timed out after {max_runtime_s}s; results may be incomplete."
+        )
+        payments = []
+    finally:
+        if max_runtime_s > 0:
+            signal.alarm(0)
+    return payments, extra_warnings
+
+
 def _send_mail(
     fwd: MIMEMultipart,
     my_address: str,
@@ -1069,7 +1110,7 @@ def _send_mail(
     """Send the forwarded message via Gmail API, sendmail, or SMTP."""
     msg_bytes = fwd.as_bytes()
     if gmail_cfg is not None:
-        _send_mail_via_gmail_api(fwd, recipients, gmail_cfg)
+        send_mail_via_gmail_api(fwd, recipients, gmail_cfg)
         return
     if smtp_cfg is None:
         # Inject via sendmail binary — queues directly into Postfix spool,
@@ -1133,35 +1174,10 @@ def main() -> None:
     if not sender_addr or not (is_trusted or allowed):
         sys.exit(0)
 
-    payments: list[PaymentItem] = []
-    extra_warnings: list[str] = []
     runtime_s = int(os.environ.get("MAX_MESSAGE_RUNTIME_S", DEFAULT_MAX_MESSAGE_RUNTIME_S))
-    if runtime_s > 0:
-        signal.signal(signal.SIGALRM, _alarm_handler)
-        signal.alarm(runtime_s)
-    try:
-        text_upns = scan_text_for_payments(msg, max_bytes)
-        log.info("Text-extracted payment candidates: %d", len(text_upns))
-
-        eslog_upns = scan_eslog_xml_for_payments(msg, max_bytes)
-        log.info("eSLOG XML payment candidates: %d", len(eslog_upns))
-
-        qr_results = scan_attachments(msg, max_bytes)
-        log.info("QR codes found (raw): %d", len(qr_results))
-        qr_unique = dedupe_qr_results(qr_results)
-        log.info("QR codes found (unique): %d", len(qr_unique))
-        qr_payments = find_payments(qr_unique)
-        log.info("Payment QR items: %d", len(qr_payments))
-
-        payments = _merge_payments_with_precedence(text_upns, eslog_upns, qr_payments)
-        log.info("Merged payment items: %d", len(payments))
-    except MessageProcessingTimeout as exc:
-        log.warning("Message processing timed out: %s", exc)
-        extra_warnings.append(f"Processing timed out after {runtime_s}s; results may be incomplete.")
-        payments = []
-    finally:
-        if runtime_s > 0:
-            signal.alarm(0)
+    payments, extra_warnings = scan_message_for_payments(
+        msg, max_bytes=max_bytes, max_runtime_s=runtime_s,
+    )
 
     to_addrs: Optional[list[str]] = None
     cc_admin = False
