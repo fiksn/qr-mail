@@ -77,8 +77,12 @@ def _parse_address(group: ET.Element | None) -> tuple[str, str, str]:
     return (name, street, city)
 
 
-def parse_eslog_invoice(xml_text: str | bytes) -> UPN:
-    """Parse an eSLOG 2.0 invoice XML document into a minimal UPN."""
+def parse_eslog_invoice(xml_text: str | bytes, *, include_payer: bool = True) -> UPN:
+    """Parse an eSLOG 2.0 invoice XML document into a minimal UPN.
+
+    When include_payer is False, payer fields are returned empty regardless
+    of what the BY/BI parties contain.
+    """
     try:
         root = ET.fromstring(xml_text)
     except ET.ParseError as exc:
@@ -99,6 +103,26 @@ def parse_eslog_invoice(xml_text: str | bytes) -> UPN:
     recipient_name, recipient_street, recipient_city = _parse_address(payee_group)
     if not recipient_name or not recipient_city:
         recipient_name, recipient_street, recipient_city = _parse_address(seller_group)
+
+    payer_name = payer_street = payer_city = payer_iban = ""
+    if include_payer:
+        # BY (buyer) is the payment originator; fall back to BI (invoicee).
+        # FII/BB carries the payer IBAN but is often masked (e.g. SI56XXX…) —
+        # drop anything that doesn't pass IBAN validation.
+        payer_group = _find_group(message, "e:G_SG2", "e:S_NAD/e:D_3035", "BY")
+        if payer_group is None:
+            payer_group = _find_group(message, "e:G_SG2", "e:S_NAD/e:D_3035", "BI")
+        payer_name, payer_street, payer_city = _parse_address(payer_group)
+        if payer_group is not None:
+            payer_iban_raw = _find_first(
+                payer_group,
+                "e:S_FII[e:D_3035='BB']/e:C_C078/e:D_3194",
+            ).replace(" ", "").upper()
+            if payer_iban_raw:
+                try:
+                    payer_iban = _validate_iban(payer_iban_raw)
+                except EPCParseError:
+                    payer_iban = ""
 
     recipient_iban_raw = _find_first(
         seller_group,
@@ -150,13 +174,13 @@ def parse_eslog_invoice(xml_text: str | bytes) -> UPN:
         raise ESlogParseError("missing recipient city")
 
     return UPN(
-        payer_iban="",
+        payer_iban=payer_iban[:34],
         deposit=False,
         withdrawal=False,
         payer_reference="",
-        payer_name="",
-        payer_street="",
-        payer_city="",
+        payer_name=payer_name[:33],
+        payer_street=payer_street[:33],
+        payer_city=payer_city[:33],
         amount_cents=amount_cents,
         payment_date=None,
         urgent=False,
