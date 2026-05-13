@@ -45,6 +45,7 @@ _RF_REF_RE = re.compile(
 )
 
 _tesseract_warned = False
+DEFAULT_MAX_IMAGE_PIXELS = 40_000_000
 
 
 def _normalize_iban(raw: str) -> Optional[str]:
@@ -191,10 +192,16 @@ def extract_image_text_from_bytes(data: bytes) -> str:
     try:
         from PIL import Image
 
+        Image.MAX_IMAGE_PIXELS = int(
+            os.environ.get("MAX_IMAGE_PIXELS", DEFAULT_MAX_IMAGE_PIXELS)
+        )
         img = Image.open(io.BytesIO(data))
         img.load()
     except ImportError:
         log.info("Pillow not installed; image OCR disabled")
+        return ""
+    except Image.DecompressionBombError as exc:
+        log.warning("image rejected for OCR (decompression bomb): %s", exc)
         return ""
     except Exception as exc:
         log.warning("image load for OCR failed: %s", exc)

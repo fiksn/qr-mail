@@ -5,6 +5,7 @@ from parsers.text_extract import (
     _normalize_iban,
     _normalize_reference,
     build_upn_from_text,
+    extract_image_text_from_bytes,
     find_iban_reference_pairs,
 )
 
@@ -167,3 +168,20 @@ class TestBuildUpnFromText:
     def test_default_city(self):
         upn = build_upn_from_text("SI27020100012345678", "SI0012345678")
         assert upn.recipient_city == "Ljubljana"
+
+
+class TestExtractImageTextFromBytes:
+    def test_rejects_decompression_bomb(self, monkeypatch):
+        Image = pytest.importorskip("PIL.Image")
+        from io import BytesIO
+
+        original_limit = Image.MAX_IMAGE_PIXELS
+        image = Image.new("RGB", (2, 2), "white")
+        buf = BytesIO()
+        image.save(buf, format="PNG")
+
+        monkeypatch.setenv("MAX_IMAGE_PIXELS", "1")
+        try:
+            assert extract_image_text_from_bytes(buf.getvalue()) == ""
+        finally:
+            Image.MAX_IMAGE_PIXELS = original_limit
