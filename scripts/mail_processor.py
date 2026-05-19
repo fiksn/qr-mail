@@ -83,8 +83,16 @@ from core.routing import (
     parse_allowed_sender_routes,
     parse_allowed_senders,
 )
-from core.upn import UPN, UPNParseError, UPNReferenceError, format_upn, parse_upn, validate_upn_reference
+from core.upn import (
+    UPN,
+    UPNParseError,
+    UPNReferenceError,
+    format_upn,
+    parse_upn,
+    validate_upn_reference,
+)
 from parsers.eslog import ESlogParseError, parse_eslog_invoice
+from parsers.icl_envelope import ICLEnvelopeParseError, parse_icl_envelope
 from parsers.xmldsig import SignatureResult, verify_eslog_signature
 from parsers.text_extract import (
     build_upn_from_text,
@@ -580,8 +588,9 @@ def _merge_payments_with_precedence(
     text_upns: list[tuple[UPN, str]],
     eslog_upns: list[tuple[UPN, str, Optional[SignatureResult]]],
     qr_payments: list[PaymentItem],
+    envelope_upns: Optional[list[tuple[UPN, str]]] = None,
 ) -> list[PaymentItem]:
-    """Merge payments by key with precedence: text < eSLOG XML < QR."""
+    """Merge payments by key with precedence: text < envelope < eSLOG XML < QR."""
     merged: dict[tuple[str, str], tuple[int, PaymentItem]] = {}
     extras: list[PaymentItem] = []
 
@@ -597,13 +606,16 @@ def _merge_payments_with_precedence(
     for upn, source in text_upns:
         add(_build_upn_payment(upn, sources=[source], note_prefix="Text-extracted"), rank=1)
 
+    for upn, source in envelope_upns or []:
+        add(_build_upn_payment(upn, sources=[source], note_prefix="e-račun envelope"), rank=2)
+
     for upn, source, sig in eslog_upns:
         p = _build_upn_payment(upn, sources=[source], note_prefix="eSLOG XML")
         p.signature = sig
-        add(p, rank=2)
+        add(p, rank=3)
 
     for payment in qr_payments:
-        add(payment, rank=3)
+        add(payment, rank=4)
 
     return extras + [payment for _, payment in merged.values()]
 
@@ -718,6 +730,46 @@ def scan_eslog_xml_for_payments(
             continue
         seen.add(key)
         results.append((upn, f"{filename} (eSLOG XML)", sig))
+
+    return results
+
+
+def scan_icl_envelopes_for_payments(
+    msg: email.message.Message,
+    max_bytes: int,
+) -> list[tuple[UPN, str]]:
+    """Extract fallback UPN candidates from ICL e-račun envelope XML attachments."""
+    results: list[tuple[UPN, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    for part in msg.walk():
+        content_type = part.get_content_type()
+        filename = part.get_filename() or f"<{content_type}>"
+        is_xml = (
+            content_type in ("application/xml", "text/xml")
+            or filename.lower().endswith(".xml")
+        )
+        if not is_xml:
+            continue
+
+        payload = part.get_payload(decode=True)
+        if payload is None or len(payload) > max_bytes:
+            continue
+
+        try:
+            upn = parse_icl_envelope(payload)
+        except ICLEnvelopeParseError:
+            log.debug("XML attachment %r is not a supported ICL envelope", filename)
+            continue
+        except Exception as exc:
+            log.warning("Failed to parse ICL envelope %r: %s", filename, exc)
+            continue
+
+        key = (upn.recipient_iban, upn.recipient_reference)
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append((upn, f"{filename} (e-račun envelope)"))
 
     return results
 
@@ -1080,13 +1132,20 @@ def scan_message_for_payments(
         log.info("Text-extracted payment candidates: %d", len(text_upns))
         eslog_upns = scan_eslog_xml_for_payments(msg, max_bytes)
         log.info("eSLOG XML payment candidates: %d", len(eslog_upns))
+        envelope_upns = scan_icl_envelopes_for_payments(msg, max_bytes)
+        log.info("e-račun envelope payment candidates: %d", len(envelope_upns))
         qr_results = scan_attachments(msg, max_bytes)
         log.info("QR codes found (raw): %d", len(qr_results))
         qr_unique = dedupe_qr_results(qr_results)
         log.info("QR codes found (unique): %d", len(qr_unique))
         qr_payments = find_payments(qr_unique)
         log.info("Payment QR items: %d", len(qr_payments))
-        payments = _merge_payments_with_precedence(text_upns, eslog_upns, qr_payments)
+        payments = _merge_payments_with_precedence(
+            text_upns,
+            eslog_upns,
+            qr_payments,
+            envelope_upns,
+        )
         log.info("Merged payment items: %d", len(payments))
     except MessageProcessingTimeout as exc:
         log.warning("Message processing timed out: %s", exc)

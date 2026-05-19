@@ -58,6 +58,50 @@ class TestPaymentPrecedence(unittest.TestCase):
         self.assertEqual(payments[0].upn.recipient_name, "eSLOG")
         self.assertEqual(payments[0].note, "eSLOG XML (converted to EPC SCT)")
 
+    def test_envelope_replaces_text_for_same_payment(self) -> None:
+        iban = "SI56020100012345678"
+        reference = "SI00123"
+
+        with mock.patch(
+            "scripts.mail_processor.generate_upn_slip_png",
+            return_value=b"slip",
+        ), mock.patch("scripts.mail_processor.generate_epc_qr", return_value=b"epc"):
+            payments = _merge_payments_with_precedence(
+                text_upns=[(_upn(iban=iban, reference=reference, name="Text"), "email-body")],
+                eslog_upns=[],
+                qr_payments=[],
+                envelope_upns=[
+                    (_upn(iban=iban, reference=reference, name="Envelope"), "ovojnica.xml")
+                ],
+            )
+
+        self.assertEqual(len(payments), 1)
+        self.assertEqual(payments[0].upn.recipient_name, "Envelope")
+        self.assertEqual(payments[0].note, "e-račun envelope (converted to EPC SCT)")
+
+    def test_eslog_replaces_envelope_for_same_payment(self) -> None:
+        iban = "SI56020100012345678"
+        reference = "SI00123"
+
+        with mock.patch(
+            "scripts.mail_processor.generate_upn_slip_png",
+            return_value=b"slip",
+        ), mock.patch("scripts.mail_processor.generate_epc_qr", return_value=b"epc"):
+            payments = _merge_payments_with_precedence(
+                text_upns=[],
+                eslog_upns=[
+                    (_upn(iban=iban, reference=reference, name="eSLOG"), "invoice.xml", None)
+                ],
+                qr_payments=[],
+                envelope_upns=[
+                    (_upn(iban=iban, reference=reference, name="Envelope"), "ovojnica.xml")
+                ],
+            )
+
+        self.assertEqual(len(payments), 1)
+        self.assertEqual(payments[0].upn.recipient_name, "eSLOG")
+        self.assertEqual(payments[0].note, "eSLOG XML (converted to EPC SCT)")
+
     def test_qr_replaces_text_for_same_payment(self) -> None:
         iban = "SI56020100012345678"
         reference = "SI00123"

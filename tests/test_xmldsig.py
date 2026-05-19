@@ -18,10 +18,18 @@ SAMPLE_PATH = os.path.join(
     os.path.dirname(os.path.dirname(__file__)),
     "racun_26-390-0438150.xml",
 )
+SAMPLE_LEGACY_XADES_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)),
+    "UPN-0055328-2-2026-4.xml",
+)
 
 needs_sample = pytest.mark.skipif(
     not os.path.exists(SAMPLE_PATH),
     reason=f"sample invoice not found: {SAMPLE_PATH}",
+)
+needs_legacy_xades_sample = pytest.mark.skipif(
+    not os.path.exists(SAMPLE_LEGACY_XADES_PATH),
+    reason=f"sample invoice not found: {SAMPLE_LEGACY_XADES_PATH}",
 )
 
 
@@ -45,6 +53,18 @@ def test_verify_valid_signature(sample_xml: bytes) -> None:
         assert result.valid is False
         assert result.error is not None
         assert "certificate trust verification failed" in result.error
+
+
+@needs_legacy_xades_sample
+def test_verify_legacy_xades_signature() -> None:
+    with open(SAMPLE_LEGACY_XADES_PATH, "rb") as f:
+        result = verify_eslog_signature(f.read())
+
+    assert result.signed is True
+    assert result.valid is True, result.error
+    assert result.signer is not None
+    assert "GIMNAZIJA VIČ" in result.signer.subject
+    assert result.signer.signing_time == "2026-05-11T11:02:41Z"
 
 
 def test_unsigned_document() -> None:

@@ -6,9 +6,9 @@ it. Uses the ``cryptography`` library for RSA verification and X.509
 certificate parsing.
 
 Inclusive C14N 1.0 (http://www.w3.org/TR/2001/REC-xml-c14n-20010315) is
-used for subtree canonicalization. Python's stdlib ``ET.canonicalize()``
-strips unused namespace declarations (exclusive behaviour), so we inject
-ancestor namespace declarations manually and hash the raw result.
+used for XMLDSig canonicalization. eSLOG issuers in the wild also publish
+legacy signatures whose invoice-body digest matches their raw XML output, so
+reference digest verification keeps a raw-subtree fallback after real C14N.
 """
 from __future__ import annotations
 
@@ -35,8 +35,10 @@ DEFAULT_INTERMEDIATE_CERTS_FILE = os.path.join(
 NS_ESLOG = "urn:eslog:2.00"
 NS_DS = "http://www.w3.org/2000/09/xmldsig#"
 NS_XDS = "http://uri.etsi.org/01903/v1.3.2#"
+NS_XDS_LEGACY = "http://uri.etsi.org/01903/v1.1.1#"
 
 _NS = {"ds": NS_DS, "xds": NS_XDS, "e": NS_ESLOG}
+_LXML_NS = {"ds": NS_DS}
 
 DIGEST_ALGORITHMS = {
     "http://www.w3.org/2000/09/xmldsig#sha1": "sha1",
@@ -164,7 +166,73 @@ def _c14n_subtree(
     if subtree is None:
         return None
     with_ns = _inject_ns(subtree, open_tag, ns_decls)
+    with_ns = with_ns.replace("\r\n", "\n").replace("\r", "\n")
     return with_ns.encode("utf-8")
+
+
+def _parse_lxml(xml_bytes: bytes):
+    """Parse XML with lxml for real C14N support, when available."""
+    try:
+        from lxml import etree
+    except ImportError:
+        return None
+
+    parser = etree.XMLParser(
+        resolve_entities=False,
+        no_network=True,
+        remove_blank_text=False,
+    )
+    try:
+        return etree.fromstring(xml_bytes, parser)
+    except Exception as exc:
+        log.debug("lxml parse failed: %s", exc)
+        return None
+
+
+def _find_lxml_signature(root):
+    """Find the XMLDSig Signature element in an lxml tree."""
+    if root is None:
+        return None
+    return root.find("ds:Signature", _LXML_NS)
+
+
+def _lxml_c14n(element) -> Optional[bytes]:
+    """Canonicalize an lxml element using inclusive C14N 1.0."""
+    if element is None:
+        return None
+    try:
+        from lxml import etree
+    except ImportError:
+        return None
+    try:
+        return etree.tostring(
+            element,
+            method="c14n",
+            exclusive=False,
+            with_comments=False,
+        )
+    except Exception as exc:
+        log.debug("lxml C14N failed: %s", exc)
+        return None
+
+
+def _find_signing_time(sig_elem: ET.Element) -> Optional[str]:
+    """Return XAdES SigningTime across supported XAdES namespace versions."""
+    signed_props_names = {
+        f"{{{NS_XDS}}}SignedSignatureProperties",
+        f"{{{NS_XDS_LEGACY}}}SignedSignatureProperties",
+    }
+    signing_time_names = {
+        f"{{{NS_XDS}}}SigningTime",
+        f"{{{NS_XDS_LEGACY}}}SigningTime",
+    }
+    for elem in sig_elem.iter():
+        if elem.tag not in signed_props_names:
+            continue
+        for child in elem:
+            if child.tag in signing_time_names and child.text:
+                return child.text.strip()
+    return None
 
 
 def _format_x509_name(name) -> str:
@@ -442,6 +510,7 @@ def _verify_reference_digest(
     digest_alg_uri: str,
     expected_b64: str,
     ns_decls: str,
+    lxml_root=None,
 ) -> tuple[bool, str]:
     """Verify one ds:Reference digest."""
     alg = DIGEST_ALGORITHMS.get(digest_alg_uri)
@@ -453,6 +522,21 @@ def _verify_reference_digest(
     if not uri.startswith("#"):
         return False, f"unsupported reference URI: {uri}"
     ref_id = uri[1:]
+
+    if lxml_root is not None:
+        try:
+            targets = lxml_root.xpath("//*[@Id=$id]", id=ref_id)
+        except Exception as exc:
+            log.debug("lxml Id lookup failed for %r: %s", ref_id, exc)
+            targets = []
+        if targets:
+            canonical = _lxml_c14n(targets[0])
+            if canonical is not None:
+                h = hashlib.new(alg)
+                h.update(canonical)
+                actual = h.digest()
+                if actual == expected:
+                    return True, f"digest OK for Id={ref_id!r}"
 
     # Find element with matching Id attribute.
     root = ET.fromstring(xml_text)
@@ -471,6 +555,7 @@ def _verify_reference_digest(
         (NS_ESLOG, ""),
         (NS_DS, "ds:"),
         (NS_XDS, "xds:"),
+        (NS_XDS_LEGACY, "xds:"),
     ]:
         if tag_local.startswith(f"{{{ns_uri}}}"):
             local = tag_local.split("}")[-1]
@@ -535,13 +620,11 @@ def verify_eslog_signature(xml_bytes: bytes) -> SignatureResult:
     signer = _parse_cert(cert_der)
 
     # Extract signing time from XAdES.
-    signing_time_elem = sig_elem.find(
-        ".//xds:SignedSignatureProperties/xds:SigningTime", _NS,
-    )
+    signing_time_text = _find_signing_time(sig_elem)
     signing_time: Optional[datetime] = None
     warnings: list[str] = []
-    if signer and signing_time_elem is not None and signing_time_elem.text:
-        signer.signing_time = signing_time_elem.text.strip()
+    if signer and signing_time_text:
+        signer.signing_time = signing_time_text
         signing_time = _parse_signing_time(signer.signing_time)
         if signing_time is None:
             warnings.append(f"unparseable signing time: {signer.signing_time!r}")
@@ -581,17 +664,24 @@ def verify_eslog_signature(xml_bytes: bytes) -> SignatureResult:
         )
     hash_name, _ = sig_alg
 
-    # Collect ancestor namespace declarations for inclusive C14N.
+    lxml_root = _parse_lxml(xml_bytes)
+    lxml_sig = _find_lxml_signature(lxml_root)
+
+    # Collect ancestor namespace declarations for legacy raw-subtree fallback.
     ns_decls = _collect_root_ns_decls(xml_text)
 
     # 1. Verify RSA signature over canonicalized SignedInfo.
-    si_canonical = _c14n_subtree(
-        xml_text, "ds:SignedInfo", "</ds:SignedInfo>", ns_decls,
-    )
+    si_canonical = None
+    if lxml_sig is not None:
+        si_canonical = _lxml_c14n(lxml_sig.find("ds:SignedInfo", _LXML_NS))
+    if si_canonical is None:
+        si_canonical = _c14n_subtree(
+            xml_text, "ds:SignedInfo", "</ds:SignedInfo>", ns_decls,
+        )
     if si_canonical is None:
         return SignatureResult(
             signed=True, valid=None, signer=signer,
-            error="could not extract ds:SignedInfo from raw XML",
+            error="could not canonicalize ds:SignedInfo",
         )
 
     rsa_ok, rsa_msg = _verify_rsa(cert_der, sig_bytes, si_canonical, hash_name)
@@ -616,6 +706,7 @@ def verify_eslog_signature(xml_bytes: bytes) -> SignatureResult:
             digest_method.get("Algorithm", ""),
             digest_value.text.strip(),
             ns_decls,
+            lxml_root,
         )
         if not ok:
             return SignatureResult(
