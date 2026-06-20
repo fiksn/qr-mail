@@ -11,11 +11,19 @@ Public API:
   epc_to_upn(epc, *, recipient_city, ...)     → UPN
 """
 import io
+from decimal import Decimal
 
 from core.epc import EPC, CHARSETS
 from core.upn import UPN, UPNReferenceError, validate_upn_reference
 
 DEFAULT_EPC_BENEFICIARY_NAME = "PREJEMNIK"
+
+# Revolut (and some other apps) reject amount-less EPC QR codes: scanning one
+# only fills the recipient and offers no way to enter an amount or pay. EPC
+# (EPC069-12) also requires amounts in the range 0.01–999999999.99. When the
+# source UPN carries no amount we emit this minimum so the QR stays payable; the
+# user adjusts the amount in their banking app before confirming.
+DEFAULT_EPC_AMOUNT = Decimal("0.01")
 
 
 # ── Serialisers ────────────────────────────────────────────────────────────────
@@ -118,6 +126,7 @@ def upn_to_epc(upn: UPN) -> EPC:
       joined with ' / ' if both are present (truncated to 140 chars).
     - Payer details and UPN-specific flags are dropped (not in EPC SCT).
     - BIC is absent in UPN → version 002 (BIC optional) is used.
+    - A missing amount becomes DEFAULT_EPC_AMOUNT so the QR stays payable.
     """
     structured_ref = ""
     unstructured_parts: list[str] = []
@@ -158,7 +167,7 @@ def upn_to_epc(upn: UPN) -> EPC:
         bic="",
         beneficiary_name=beneficiary_name,
         beneficiary_iban=upn.recipient_iban,
-        amount=upn.amount if upn.amount_cents else None,
+        amount=upn.amount if upn.amount_cents else DEFAULT_EPC_AMOUNT,
         purpose_code=upn.purpose_code,
         structured_ref=structured_ref,
         unstructured_ref=unstructured_ref,

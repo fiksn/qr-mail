@@ -1,7 +1,7 @@
 {
   description = "qr-mail — Postfix pipe handler that forwards mail from allowed senders to an admin address";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
 
   outputs = { self, nixpkgs }:
     let

@@ -1,0 +1,30 @@
+[project]
+name = "qr-mail"
+version = "0.1.0"
+description = "Forwards mail from allowed senders and replaces Slovenian UPN QR codes with EPC QR codes"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+dependencies = [
+    "pillow>=11",         # image loading / generation
+    "pyzbar>=0.1.9",      # QR detection (needs the native zbar library, see README)
+    "pdf2image>=1.17",    # PDF → image (needs poppler-utils, see README)
+    "pytesseract>=0.3.13", # OCR (needs the tesseract binary, see README)
+    "segno>=1.6",         # QR generation with ECI support
+    "defusedxml>=0.7.1",  # safe XML parsing (XXE / billion laughs)
+    "lxml>=5",            # XML canonicalization for XMLDSig verification
+    "cryptography>=43",   # X.509 parsing + RSA signature verification
+    "google-api-python-client>=2.190", # Gmail API
+    "google-auth>=2.40",  # service-account credentials
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+# qr-mail is run from the repository root (scripts import the top-level
+# `core`/`parsers`/`scripts` packages directly), so uv only needs to manage the
+# environment — it does not build or install the project itself.
+[tool.uv]
+package = false

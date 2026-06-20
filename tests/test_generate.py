@@ -1,6 +1,6 @@
 import unittest
 
-from core.generate import upn_to_epc
+from core.generate import DEFAULT_EPC_AMOUNT, upn_to_epc
 from core.upn import UPN, UPNLegacyOCRError, format_legacy_upn_ocr
 
 
@@ -55,7 +55,15 @@ class TestUPNToEPC(unittest.TestCase):
             )
         )
         self.assertEqual(epc.beneficiary_name, "PREJEMNIK")
-        self.assertIsNone(epc.amount)
+        self.assertEqual(epc.amount, DEFAULT_EPC_AMOUNT)
+
+    def test_missing_amount_defaults_to_minimum(self) -> None:
+        epc = upn_to_epc(self._upn(recipient_reference="SI001234", amount_cents=0))
+        self.assertEqual(epc.amount, DEFAULT_EPC_AMOUNT)
+
+    def test_present_amount_is_preserved(self) -> None:
+        epc = upn_to_epc(self._upn(recipient_reference="SI001234", amount_cents=5629))
+        self.assertEqual(epc.amount, self._upn(recipient_reference="SI001234", amount_cents=5629).amount)
 
     def test_format_legacy_upn_ocr_uses_expected_segments(self) -> None:
         upn = self._upn(

@@ -56,10 +56,33 @@ Notes:
 
 ## Other uses
 
-You can still use the python tooling independently of Nix, for instance to convert or craft payment QR codes.
-All executable entry points now live under `scripts/`.
+You can run the Python tooling independently of the mail server, for instance to convert or craft payment QR codes.
+All executable entry points live under `scripts/`.
 
-Example:
+### Getting an environment
+
+The Python code needs three native libraries that are not installed by `pip`/`uv`:
+`zbar` (for `pyzbar` QR decoding), `poppler` (for `pdf2image`), and `tesseract` (for OCR).
+Pick **either** Nix **or** uv — both give you the same working environment.
+
+**Nix** (bundles the native libraries automatically):
+```bash
+nix develop                       # drop into a shell with everything available
+nix develop -c python3 scripts/generate_qr.py --format both   # or run a single command
+```
+
+**uv** (manages the Python side; install the native libraries with your OS package manager):
+```bash
+# macOS:        brew install zbar poppler tesseract
+# Debian/Ubuntu: sudo apt install libzbar0 poppler-utils tesseract-ocr
+uv sync                           # create .venv from pyproject.toml + uv.lock
+uv run pytest                     # run the tests
+uv run python scripts/generate_qr.py --format both
+```
+
+`uv sync` installs the runtime dependencies; add `--group dev` for `pytest`. Exact versions are pinned in `uv.lock`.
+
+### Examples
 ```bash
 python3 scripts/generate_qr.py --format both        # UPN + EPC QR PNGs
 python3 scripts/generate_qr.py --format slip        # full UPN poloznica PNG (pink form + QR)
@@ -75,15 +98,9 @@ ADMIN_EMAIL=admin@example.com MY_ADDRESS=qr@example.com ALLOWED_SENDERS='*@examp
   python3 scripts/mail_processor.py [envelope-sender] < message.eml
 ```
 
-Note: `--format slip` / `--format all` needs Pillow (`pip install pillow`).
+The commands above assume an active environment (`nix develop` shell or `uv run`/an activated `.venv`).
 Default slip template path is `./upn_base_empty.jpg` (bundled in repo).
 Legacy OCR slip mode uses `./upn_base_legacy_ocr.jpg` by default and requires an OCR-compatible recipient reference (`SI12`).
-
-If you use the Nix dev shell, the same commands work via:
-```bash
-nix develop -c python3 scripts/generate_qr.py --format both
-nix develop -c python3 scripts/debug_process.py invoice.pdf
-```
 
 Project layout:
 
