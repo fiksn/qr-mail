@@ -18,6 +18,7 @@ from typing import Any, Optional
 if __package__ in {None, ""}:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from core.epc import EPC
 from core.generate import (
     epc_to_string,
     generate_epc_qr,
@@ -314,6 +315,88 @@ def _load_font(size: int, *, bold: bool = False) -> Any:
         except OSError:
             continue
     return ImageFont.load_default()
+
+
+def _epc_monogram(name: str) -> str:
+    """Derive a 1–2 character monogram from a beneficiary name (e.g. 'SK')."""
+    words = [w for w in name.strip().split() if w]
+    if not words:
+        return ""
+    if len(words) == 1:
+        return words[0][:2].upper()
+    return (words[0][0] + words[1][0]).upper()
+
+
+def _fit_font(draw: Any, text: str, max_width: int, start_size: int, *, bold: bool) -> Any:
+    """Return the largest mono font (down to size 9) whose text fits max_width."""
+    size = start_size
+    while size > 9:
+        font = _load_font(size, bold=bold)
+        if draw.textlength(text, font=font) <= max_width:
+            return font
+        size -= 1
+    return _load_font(9, bold=bold)
+
+
+def generate_epc_qr_labeled(epc: EPC, *, scale: int = 10) -> bytes:
+    """Return PNG bytes of an EPC QR with a recipient/amount caption above it
+    and a small monogram of the recipient's initials in the centre.
+
+    The caption sits in a separate strip above the QR so the code's modules are
+    never touched. The monogram covers only ~5% of the QR area, well within the
+    error-correction budget (ECC M), so scannability is preserved.
+
+    When the EPC carries no beneficiary name, the name line and the monogram are
+    both omitted (no placeholder is invented).
+    """
+    from PIL import Image, ImageDraw
+
+    base = Image.open(io.BytesIO(generate_epc_qr(epc, scale=scale))).convert("RGB")
+    width, qr_height = base.size
+
+    name = epc.beneficiary_name.strip()
+    amount = f"EUR {epc.amount:.2f}" if epc.amount is not None else ""
+    if not name and not amount:
+        return generate_epc_qr(epc, scale=scale)
+
+    pad = max(width // 40, 6)
+    measure = ImageDraw.Draw(base)
+    caption_lines: list[tuple[str, Any]] = []
+    if name:
+        name_font = _fit_font(measure, name, width - 2 * pad, max(width // 16, 16), bold=True)
+        caption_lines.append((name, name_font))
+        amount_size = max(int(name_font.size * 0.85), 12)
+    else:
+        amount_size = max(width // 16, 16)
+    if amount:
+        caption_lines.append((amount, _load_font(amount_size, bold=True)))
+
+    line_h = max(f.size for _, f in caption_lines) + max(f.size for _, f in caption_lines) // 3
+    caption_h = pad + line_h * len(caption_lines) + pad
+
+    canvas = Image.new("RGB", (width, caption_h + qr_height), "white")
+    canvas.paste(base, (0, caption_h))
+    draw = ImageDraw.Draw(canvas)
+
+    cx = width // 2
+    for i, (text, font) in enumerate(caption_lines):
+        draw.text((cx, pad + line_h * i + line_h // 2), text, font=font, fill="black", anchor="mm")
+
+    monogram = _epc_monogram(name)
+    if monogram:
+        box = int(width * 0.22)
+        bcx, bcy = width // 2, caption_h + qr_height // 2
+        half = box // 2
+        draw.rounded_rectangle(
+            (bcx - half, bcy - half, bcx + half, bcy + half),
+            radius=box // 6, fill="white", outline="#888888", width=max(scale // 5, 1),
+        )
+        mono_font = _fit_font(draw, monogram, int(box * 0.7), box, bold=True)
+        draw.text((bcx, bcy), monogram, font=mono_font, fill="black", anchor="mm")
+
+    out = io.BytesIO()
+    canvas.save(out, format="PNG")
+    return out.getvalue()
 
 
 def _load_ocr_font(size: int) -> Any:

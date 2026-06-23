@@ -49,6 +49,7 @@ header is used (less secure — the From header is trivially spoofable).
 from __future__ import annotations
 
 import base64
+import contextlib
 import email
 import email.encoders
 import html
@@ -75,7 +76,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.epc import EPC, EPCParseError, format_epc, parse_epc
-from core.generate import epc_to_string, generate_epc_qr, upn_to_epc
+from core.generate import epc_to_string, upn_to_epc
 from core.routing import (
     find_route,
     is_allowed_sender,
@@ -100,10 +101,17 @@ from parsers.text_extract import (
     extract_pdf_text,
     find_iban_reference_pairs,
 )
-from scripts.generate_qr import generate_upn_slip_png
+from scripts.generate_qr import generate_epc_qr_labeled, generate_upn_slip_png
 
+# Default to INFO: this runs as a Postfix pipe(8) command, whose stderr is
+# captured into a bounded buffer for bounce diagnostics. DEBUG-level output
+# (raw QR bytes, full payment dumps) overruns that buffer; Postfix then closes
+# the pipe, and the interpreter's shutdown flush dies with BrokenPipeError —
+# surfacing as "Command died with status 120" even though delivery succeeded.
+# Override with QR_MAIL_LOG_LEVEL=DEBUG for local debugging.
+_LOG_LEVEL = getattr(logging, os.environ.get("QR_MAIL_LOG_LEVEL", "INFO").upper(), logging.INFO)
 logging.basicConfig(
-    stream=sys.stderr, level=logging.DEBUG,
+    stream=sys.stderr, level=_LOG_LEVEL,
     format="qr-mail: %(levelname)s %(message)s",
 )
 log = logging.getLogger(__name__)
@@ -290,11 +298,35 @@ def _decode_qr_bytes(data: bytes) -> str:
         return data.decode("iso-8859-2", errors="replace")
 
 
+@contextlib.contextmanager
+def _suppress_fd_stderr() -> Any:
+    """Redirect OS-level fd 2 to /dev/null for the duration of the block.
+
+    ZBar's C code writes diagnostics straight to fd 2, bypassing sys.stderr.
+    That binary noise pollutes Postfix bounce diagnostics, so silence it unless
+    DEBUG logging is requested.
+    """
+    if log.isEnabledFor(logging.DEBUG):
+        yield
+        return
+    sys.stderr.flush()
+    saved_fd = os.dup(2)
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull, 2)
+        yield
+    finally:
+        os.dup2(saved_fd, 2)
+        os.close(devnull)
+        os.close(saved_fd)
+
+
 def scan_image_for_qr(img: Any) -> list[str]:
     try:
         from pyzbar import pyzbar
 
-        results = pyzbar.decode(img, symbols=[pyzbar.ZBarSymbol.QRCODE])
+        with _suppress_fd_stderr():
+            results = pyzbar.decode(img, symbols=[pyzbar.ZBarSymbol.QRCODE])
         return [_decode_qr_bytes(r.data) for r in results]
     except ImportError:
         log.info("pyzbar not installed; QR decoding disabled")
@@ -495,7 +527,7 @@ def _build_upn_payment(
     try:
         epc = upn_to_epc(upn)
         payload = epc_to_string(epc)
-        png = generate_epc_qr(epc)
+        png = generate_epc_qr_labeled(epc)
         return PaymentItem(
             sources=sources,
             kind="upn",
@@ -546,7 +578,7 @@ def find_payments(qr_results: list[tuple[str, list[str]]]) -> list[PaymentItem]:
             )
             payload = qr_text.replace("\r\n", "\n").replace("\r", "\n")
             try:
-                png = generate_epc_qr(epc)
+                png = generate_epc_qr_labeled(epc)
             except Exception as exc:
                 log.warning(
                     "EPC QR regeneration failed for QR in %r: %s",
@@ -1270,5 +1302,29 @@ def main() -> None:
     _send_mail(fwd, my_address, recipients, _load_smtp_config(), _load_gmail_config())
 
 
+def _silence_std_streams_on_exit() -> None:
+    """Point stdout/stderr at /dev/null so the interpreter's shutdown flush
+    can't raise BrokenPipeError when Postfix has already closed the pipe.
+
+    Without this, a successful run that emitted more diagnostics than Postfix's
+    pipe buffer holds exits with status 120, triggering a spurious bounce.
+    """
+    try:
+        sys.stdout.flush()
+    except BrokenPipeError:
+        pass
+    try:
+        sys.stderr.flush()
+    except BrokenPipeError:
+        pass
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, sys.stdout.fileno())
+    os.dup2(devnull, sys.stderr.fileno())
+    os.close(devnull)
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        _silence_std_streams_on_exit()

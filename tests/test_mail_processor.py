@@ -46,7 +46,7 @@ class TestPaymentPrecedence(unittest.TestCase):
         reference = "SI00123"
 
         with mock.patch("scripts.mail_processor.generate_upn_slip_png", return_value=b"slip"), mock.patch(
-            "scripts.mail_processor.generate_epc_qr", return_value=b"epc"
+            "scripts.mail_processor.generate_epc_qr_labeled", return_value=b"epc"
         ):
             payments = _merge_payments_with_precedence(
                 text_upns=[(_upn(iban=iban, reference=reference, name="Text"), "email-body")],
@@ -65,7 +65,7 @@ class TestPaymentPrecedence(unittest.TestCase):
         with mock.patch(
             "scripts.mail_processor.generate_upn_slip_png",
             return_value=b"slip",
-        ), mock.patch("scripts.mail_processor.generate_epc_qr", return_value=b"epc"):
+        ), mock.patch("scripts.mail_processor.generate_epc_qr_labeled", return_value=b"epc"):
             payments = _merge_payments_with_precedence(
                 text_upns=[(_upn(iban=iban, reference=reference, name="Text"), "email-body")],
                 eslog_upns=[],
@@ -86,7 +86,7 @@ class TestPaymentPrecedence(unittest.TestCase):
         with mock.patch(
             "scripts.mail_processor.generate_upn_slip_png",
             return_value=b"slip",
-        ), mock.patch("scripts.mail_processor.generate_epc_qr", return_value=b"epc"):
+        ), mock.patch("scripts.mail_processor.generate_epc_qr_labeled", return_value=b"epc"):
             payments = _merge_payments_with_precedence(
                 text_upns=[],
                 eslog_upns=[
@@ -291,7 +291,7 @@ class TestMailFormatting(unittest.TestCase):
         )
 
         with mock.patch("scripts.mail_processor.generate_upn_slip_png", return_value=b"slip"), mock.patch(
-            "scripts.mail_processor.generate_epc_qr", return_value=b"epc"
+            "scripts.mail_processor.generate_epc_qr_labeled", return_value=b"epc"
         ):
             lines = _build_payment_text_block(payment)
 
