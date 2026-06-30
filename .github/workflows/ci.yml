@@ -23,6 +23,10 @@ jobs:
           python -m pip install
           cryptography==47.0.0
           defusedxml==0.7.1
+          google-api-python-client==2.197.0
+          google-auth==2.55.0
+          google-auth-oauthlib==1.4.0
+          lxml==6.1.1
           pillow==12.2.0
           pytest==9.0.3
           segno==1.6.6

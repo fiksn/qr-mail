@@ -1,8 +1,6 @@
 import unittest
 from unittest import mock
 
-from googleapiclient.errors import HttpError
-
 from scripts.gmail_fetch import gmail_from_clause, record_failure
 
 
@@ -44,7 +42,7 @@ class TestRecordFailure(unittest.TestCase):
 
     def test_label_api_error_is_swallowed(self) -> None:
         client = mock.Mock()
-        client.add_label.side_effect = HttpError(mock.Mock(status=500), b"err")
+        client.add_label.side_effect = RuntimeError("api down")
         attempts: dict[str, int] = {}
         # Should not raise even if labelling fails.
         record_failure(

@@ -35,8 +35,6 @@ import time
 if __package__ in {None, ""}:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from googleapiclient.errors import HttpError
-
 from core.routing import parse_allowed_senders
 from scripts.gmail_client import GmailClient, GmailConfigError, load_gmail_config
 from scripts.gmail_reply import gmail_from_clause, process_message
@@ -74,7 +72,7 @@ def record_failure(
         )
         try:
             client.add_label(msg_id, failed_label_id)
-        except HttpError as label_exc:
+        except Exception as label_exc:  # noqa: BLE001
             log.error("could not label %s failed: %s", msg_id, label_exc)
         attempts.pop(msg_id, None)
     else:
@@ -182,10 +180,8 @@ def main() -> None:
                         max_attempts=max_attempts,
                         exc=exc,
                     )
-        except HttpError as exc:
-            log.error("Gmail API error during poll: %s", exc)
         except Exception as exc:  # noqa: BLE001
-            log.error("Unexpected error: %s", exc)
+            log.error("Error during poll: %s", exc)
 
         time.sleep(poll_interval)
 
