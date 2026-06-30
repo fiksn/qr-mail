@@ -1,58 +1,55 @@
 #!/usr/bin/env python3
 """Backfill: scan a Google Workspace mailbox for past mail from configured
-senders, parse payment data in-process, and forward results via the same
-service account.
+senders and insert QR replies into each matching conversation.
 
-Authenticates via a service account with domain-wide delegation; the mailbox
-is impersonated. Allowed senders are loaded from a config file (one address
-per line, '#' for comments). For each message whose From: matches the
-allowlist and whose contents yield at least one payment, a forwarded mail is
-sent through the Gmail API (impersonating the mailbox) to the result address.
-Messages with no payment data are skipped silently.
+Same delivery model as the live daemon (scripts/gmail_fetch.py): for every
+message whose From: matches the allowlist and that yields at least one payment,
+an artificial reply carrying the EPC QR codes is inserted into the original
+thread. Messages with no payment data are skipped silently.
+
+Authenticates via either auth mode (auto-detected, see scripts/gmail_client.py).
+A service account (domain-wide delegation) can impersonate any mailbox; OAuth is
+limited to the consenting user's own mailbox.
 
 Usage:
   GMAIL_SERVICE_ACCOUNT_FILE=key.json \\
   python3 scripts/gmail_backfill.py user@example.com 1M
 
-  # Forward results to a different mailbox
-  python3 scripts/gmail_backfill.py user@example.com 1M \\
-      --result-email admin@example.com
-
   # Use a custom allowlist
   python3 scripts/gmail_backfill.py user@example.com 1M --config my_senders.txt
 
-  # Preview matches; do not process or send mail
+  # Preview matches; do not process or insert anything
   python3 scripts/gmail_backfill.py user@example.com 1M --dry-run
 
 Duration syntax: N + d (days), w (weeks), m or M (months, ~30d), or y
 (years, ~365d). Examples: 14d, 2w, 1M, 1y.
 """
+from __future__ import annotations
+
 import argparse
-import base64
-import email
 import logging
 import os
 import re
 import sys
 from datetime import datetime, timedelta, timezone
-from email.utils import parseaddr
 from pathlib import Path
-from typing import Any
 
 if __package__ in {None, ""}:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.routing import is_allowed_sender, parse_allowed_senders
-from scripts.mail_processor import (
+from core.routing import parse_allowed_senders
+from scripts.gmail_client import (
+    GmailClient,
     GmailConfig,
-    send_mail_via_gmail_api,
-    build_forward,
-    scan_message_for_payments,
+    GmailConfigError,
+    load_gmail_config,
 )
-
-# gmail.modify covers both read and send so the same credentials drive both
-# listing/fetching and the outbound forward.
-SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
+from scripts.gmail_reply import gmail_from_clause, process_message
+from scripts.mail_processor import (
+    DEFAULT_MAX_ATTACHMENT_BYTES,
+    DEFAULT_MAX_EMAIL_BYTES,
+    DEFAULT_MAX_MESSAGE_RUNTIME_S,
+)
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "allowed_senders.txt"
 
@@ -99,106 +96,44 @@ def load_allowed_senders(path: Path) -> list[str]:
     return senders
 
 
-def build_service(sa_file: str, impersonate: str) -> Any:
-    from google.oauth2 import service_account
-    from googleapiclient.discovery import build
+def build_client(mailbox: str, service_account_file: str) -> GmailClient:
+    """Build a GmailClient for ``mailbox`` (DWD impersonation or OAuth)."""
+    if service_account_file:
+        cfg = GmailConfig(
+            auth_mode="service_account",
+            user=mailbox,
+            service_account_file=service_account_file,
+        )
+        return GmailClient(cfg)
 
-    creds = service_account.Credentials.from_service_account_file(
-        sa_file, scopes=SCOPES,
-    ).with_subject(impersonate)
-    return build("gmail", "v1", credentials=creds, cache_discovery=False)
+    cfg = load_gmail_config()
+    if cfg is None:
+        raise SystemExit(
+            "no Gmail credentials configured (set GMAIL_SERVICE_ACCOUNT_FILE or "
+            "GMAIL_OAUTH_TOKEN_FILE, or pass --service-account)"
+        )
+    if cfg.auth_mode == "service_account":
+        return GmailClient.for_user(cfg, mailbox)
+    if cfg.user != mailbox:
+        raise SystemExit(
+            f"OAuth credentials are bound to {cfg.user!r}; cannot backfill {mailbox!r}. "
+            "Use a service account for domain-wide delegation."
+        )
+    return GmailClient(cfg)
 
 
 def build_query(senders: list[str], since: datetime) -> str:
-    from_clause = " OR ".join(f"from:{s}" for s in senders)
-    return f"({from_clause}) after:{int(since.timestamp())}"
-
-
-def list_matching_ids(service: Any, query: str) -> list[str]:
-    ids: list[str] = []
-    page_token = ""
-    while True:
-        kwargs: dict[str, Any] = {"userId": "me", "q": query, "maxResults": 500}
-        if page_token:
-            kwargs["pageToken"] = page_token
-        resp = service.users().messages().list(**kwargs).execute()
-        for m in resp.get("messages", []):
-            ids.append(m["id"])
-        page_token = resp.get("nextPageToken", "")
-        if not page_token:
-            break
-    return ids
-
-
-def fetch_raw(service: Any, msg_id: str) -> bytes:
-    resp = service.users().messages().get(
-        userId="me", id=msg_id, format="raw",
-    ).execute()
-    return base64.urlsafe_b64decode(resp["raw"] + "==")
-
-
-def fetch_summary(service: Any, msg_id: str) -> str:
-    resp = service.users().messages().get(
-        userId="me", id=msg_id, format="metadata",
-        metadataHeaders=["From", "Subject", "Date"],
-    ).execute()
-    headers = {h["name"]: h["value"] for h in resp.get("payload", {}).get("headers", [])}
-    return (
-        f"From={headers.get('From', '?')!r} "
-        f"Subject={headers.get('Subject', '?')!r} "
-        f"Date={headers.get('Date', '?')!r}"
-    )
-
-
-def process_message(
-    raw: bytes,
-    *,
-    allowed_patterns: list[str],
-    mailbox: str,
-    result_email: str,
-    gmail_cfg: GmailConfig,
-) -> str:
-    """Parse, scan, and conditionally forward one message.
-
-    Returns one of: 'sent', 'skipped-sender', 'skipped-empty'.
-    """
-    msg = email.message_from_bytes(raw)
-    _, sender_addr = parseaddr(msg.get("From", ""))
-    sender_addr = sender_addr.strip().lower()
-    if not sender_addr or not is_allowed_sender(sender_addr, allowed_patterns):
-        log.info("skip: From %r not in allowlist", sender_addr)
-        return "skipped-sender"
-
-    payments, extra_warnings = scan_message_for_payments(msg)
-    if not payments:
-        log.info("skip: no payment data (From=%s)", sender_addr)
-        return "skipped-empty"
-
-    fwd = build_forward(
-        msg,
-        sender_addr,
-        mailbox,
-        result_email,
-        reply_to_sender=False,
-        extra_warnings=extra_warnings,
-        payments=payments,
-    )
-    send_mail_via_gmail_api(fwd, [result_email], gmail_cfg)
-    log.info("forwarded: From=%s payments=%d -> %s", sender_addr, len(payments), result_email)
-    return "sent"
+    from_clause = gmail_from_clause(senders) or "(" + " OR ".join(f"from:{s}" for s in senders) + ")"
+    return f"{from_clause} after:{int(since.timestamp())}"
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Backfill a Gmail mailbox via DWD and forward parsed payment data.",
+        description="Backfill a Gmail mailbox and insert QR replies into threads.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("mailbox", help="Mailbox address to impersonate via DWD")
+    parser.add_argument("mailbox", help="Mailbox address to scan (DWD subject or OAuth user)")
     parser.add_argument("duration", help="Time window, e.g. 30d, 2w, 1M, 1y")
-    parser.add_argument(
-        "--result-email", default="",
-        help="Recipient of forwarded results (default: mailbox).",
-    )
     parser.add_argument(
         "--config", default=str(DEFAULT_CONFIG_PATH),
         help=f"Allowed-sender file (default: {DEFAULT_CONFIG_PATH}).",
@@ -210,7 +145,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--dry-run", action="store_true",
-        help="List matches; do not process or send mail.",
+        help="List matches; do not process or insert anything.",
     )
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
@@ -220,13 +155,6 @@ def main() -> None:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="qr-mail-backfill: %(levelname)s %(message)s",
     )
-
-    if not args.service_account:
-        print(
-            "ERROR: --service-account or $GMAIL_SERVICE_ACCOUNT_FILE is required",
-            file=sys.stderr,
-        )
-        sys.exit(1)
 
     senders = load_allowed_senders(Path(args.config))
     log.info("Loaded %d allowed sender(s) from %s", len(senders), args.config)
@@ -240,44 +168,46 @@ def main() -> None:
     since = datetime.now(timezone.utc) - delta
     log.info("Scanning messages newer than %s (~%s ago)", since.isoformat(), delta)
 
-    result_email = args.result_email.strip() or args.mailbox
+    my_address = os.environ.get("MY_ADDRESS", "").strip() or args.mailbox
+    max_email_bytes = int(os.environ.get("MAX_EMAIL_BYTES", DEFAULT_MAX_EMAIL_BYTES))
+    max_attachment_bytes = int(os.environ.get("MAX_ATTACHMENT_BYTES", DEFAULT_MAX_ATTACHMENT_BYTES))
+    max_runtime_s = int(os.environ.get("MAX_MESSAGE_RUNTIME_S", DEFAULT_MAX_MESSAGE_RUNTIME_S))
 
-    service = build_service(args.service_account, args.mailbox)
+    try:
+        client = build_client(args.mailbox, args.service_account)
+    except GmailConfigError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+
     query = build_query(senders, since)
     log.debug("Gmail query: %s", query)
 
-    ids = list_matching_ids(service, query)
+    ids = client.search(query)
     log.info("Found %d matching message(s)", len(ids))
 
     if args.dry_run:
-        for msg_id in ids:
-            print(f"{msg_id}  {fetch_summary(service, msg_id)}")
-        return
-    if not ids:
+        for msg_id, thread_id in ids:
+            print(f"{msg_id}  thread={thread_id}")
         return
 
-    gmail_cfg = GmailConfig(
-        service_account_file=args.service_account,
-        impersonate_address=args.mailbox,
-    )
-
-    sent = 0
-    skipped_sender = 0
-    skipped_empty = 0
-    failed = 0
-    for msg_id in ids:
+    sent = skipped_sender = skipped_empty = failed = 0
+    for msg_id, thread_id in ids:
         try:
-            raw = fetch_raw(service, msg_id)
-            result = process_message(
+            raw = client.get_raw_message(msg_id)
+            status = process_message(
+                client,
                 raw,
+                my_address=my_address,
                 allowed_patterns=allowed_patterns,
-                mailbox=args.mailbox,
-                result_email=result_email,
-                gmail_cfg=gmail_cfg,
+                thread_id=thread_id,
+                strict_sender=False,
+                max_email_bytes=max_email_bytes,
+                max_attachment_bytes=max_attachment_bytes,
+                max_runtime_s=max_runtime_s,
             )
-            if result == "sent":
+            if status == "sent":
                 sent += 1
-            elif result == "skipped-sender":
+            elif status == "skipped-sender":
                 skipped_sender += 1
             else:
                 skipped_empty += 1
@@ -286,7 +216,7 @@ def main() -> None:
             failed += 1
 
     log.info(
-        "Done. sent=%d skipped_sender=%d skipped_empty=%d failed=%d total=%d",
+        "Done. replied=%d skipped_sender=%d skipped_empty=%d failed=%d total=%d",
         sent, skipped_sender, skipped_empty, failed, len(ids),
     )
 

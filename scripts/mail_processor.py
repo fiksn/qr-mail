@@ -14,6 +14,9 @@ Configuration via environment variables:
   ALLOWED_SENDER_ROUTES  optional routes: "<glob>=a@b.com,c@d.com:..."; admin is CCed
   TRUSTED_SENDERS        like ALLOWED_SENDERS, but reply to sender + CC admin
   MAX_ATTACHMENT_BYTES   size limit per attachment in bytes (default: 104857600 = 100 MB)
+  MAX_EMAIL_BYTES        split forwarded mail into multiple messages when the
+                         generated payment artifacts would exceed this size
+                         (default: 20971520 = 20 MB)
   EPC_TO_UPN_CITY        recipient city used when converting EPC → UPN (default: Ljubljana)
   MAX_PDF_PAGES          max PDF pages rendered per attachment (default: 10)
   PDF_RENDER_DPI         DPI for PDF→image rendering (default: 200)
@@ -29,11 +32,23 @@ Configuration via environment variables:
   SMTP_INSECURE_SKIP_VERIFY
                          when "true", disable SMTP certificate and hostname
                          verification (discouraged; default: false)
-  GMAIL_SERVICE_ACCOUNT_FILE
-                         when set together with GMAIL_IMPERSONATE_ADDRESS, send
-                         outbound mail via Gmail API instead of sendmail/SMTP
   GMAIL_IMPERSONATE_ADDRESS
-                         Google Workspace mailbox to impersonate for Gmail API send
+                         mailbox to act on for the Gmail transport. When any
+                         Gmail credentials are configured, results are inserted
+                         as artificial replies into this mailbox (threaded onto
+                         the original) instead of being sent via sendmail/SMTP.
+                         Replies are only inserted when payment data is found.
+  GMAIL_SERVICE_ACCOUNT_FILE
+                         service-account JSON key → domain-wide delegation mode
+  GMAIL_OAUTH_CLIENT_SECRET_FILE
+                         OAuth client-secret JSON → single-user OAuth mode
+                         (used for the one-time consent flow)
+  GMAIL_OAUTH_TOKEN_FILE
+                         cached OAuth token JSON (runtime credential for OAuth mode)
+  QRMAIL_GMAIL_THREAD_ID
+                         Gmail thread ID of the message being processed, so the
+                         inserted reply lands in the same conversation (set by
+                         the Gmail fetch daemon)
   MAX_MESSAGE_BYTES      max raw message size to read from stdin (default: 157286400 = 150 MB)
 
 Standalone usage:
@@ -48,7 +63,6 @@ header is used (less secure — the From header is trivially spoofable).
 """
 from __future__ import annotations
 
-import base64
 import contextlib
 import email
 import email.encoders
@@ -64,7 +78,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from email.mime.base import MIMEBase
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
@@ -94,6 +108,7 @@ from core.upn import (
 )
 from parsers.eslog import ESlogParseError, parse_eslog_invoice
 from parsers.icl_envelope import ICLEnvelopeParseError, parse_icl_envelope
+from parsers.pain import PainParseError, parse_pain_credit_transfers
 from parsers.xmldsig import SignatureResult, verify_eslog_signature
 from parsers.text_extract import (
     build_upn_from_text,
@@ -118,6 +133,7 @@ log = logging.getLogger(__name__)
 
 DEFAULT_MAX_MESSAGE_BYTES = 150 * 1024 * 1024  # 150 MB
 DEFAULT_MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024  # 100 MB
+DEFAULT_MAX_EMAIL_BYTES = 20 * 1024 * 1024  # 20 MB — split outbound mail past this
 DEFAULT_MAX_PDF_PAGES = 10
 DEFAULT_PDF_RENDER_DPI = 200
 DEFAULT_PDF_RENDER_TIMEOUT_S = 20
@@ -136,12 +152,6 @@ class SmtpConfig:
     user: str
     password: str
     tls: str  # "starttls", "tls", or "none"
-
-
-@dataclass
-class GmailConfig:
-    service_account_file: str
-    impersonate_address: str
 
 
 class MessageProcessingTimeout(RuntimeError):
@@ -236,9 +246,14 @@ def _derive_verified_gmail_sender(msg: email.message.Message) -> str:
     if not from_addr or not from_domain:
         return ""
 
-    auth_headers = (msg.get_all("Authentication-Results", []) or []) + (
+    # Only trust the topmost Authentication-Results header — the one stamped by
+    # the receiving boundary (Gmail) at delivery. Headers appear newest-first, so
+    # index 0 is Gmail's verdict; any Authentication-Results lines below it were
+    # present in the message before it reached Gmail and are attacker-forgeable.
+    # Trusting all of them would let a sender spoof "dmarc=pass" for any domain.
+    auth_headers = (msg.get_all("Authentication-Results", []) or [])[:1] + (
         msg.get_all("ARC-Authentication-Results", []) or []
-    )
+    )[:1]
     if not auth_headers:
         log.warning("Gmail message lacks Authentication-Results headers")
         return ""
@@ -621,8 +636,12 @@ def _merge_payments_with_precedence(
     eslog_upns: list[tuple[UPN, str, Optional[SignatureResult]]],
     qr_payments: list[PaymentItem],
     envelope_upns: Optional[list[tuple[UPN, str]]] = None,
+    pain_upns: Optional[list[tuple[UPN, str]]] = None,
 ) -> list[PaymentItem]:
-    """Merge payments by key with precedence: text < envelope < eSLOG XML < QR."""
+    """Merge payments by key with precedence.
+
+    text < envelope < eSLOG XML < pain.001 < QR.
+    """
     merged: dict[tuple[str, str], tuple[int, PaymentItem]] = {}
     extras: list[PaymentItem] = []
 
@@ -646,8 +665,11 @@ def _merge_payments_with_precedence(
         p.signature = sig
         add(p, rank=3)
 
+    for upn, source in pain_upns or []:
+        add(_build_upn_payment(upn, sources=[source], note_prefix="pain.001"), rank=4)
+
     for payment in qr_payments:
-        add(payment, rank=4)
+        add(payment, rank=5)
 
     return extras + [payment for _, payment in merged.values()]
 
@@ -806,6 +828,54 @@ def scan_icl_envelopes_for_payments(
     return results
 
 
+def scan_pain_xml_for_payments(
+    msg: email.message.Message,
+    max_bytes: int,
+) -> list[tuple[UPN, str]]:
+    """Extract UPN candidates from ISO 20022 pain.001 XML attachments.
+
+    A single pain.001 batch can hold many credit transfers; each becomes its
+    own UPN (and downstream its own invoice + QR code).
+    """
+    recipient_city = os.environ.get("EPC_TO_UPN_CITY", "Ljubljana")
+    results: list[tuple[UPN, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    for part in msg.walk():
+        content_type = part.get_content_type()
+        filename = part.get_filename() or f"<{content_type}>"
+        is_xml = (
+            content_type in ("application/xml", "text/xml")
+            or filename.lower().endswith(".xml")
+        )
+        if not is_xml:
+            continue
+
+        payload = part.get_payload(decode=True)
+        if payload is None or len(payload) > max_bytes:
+            continue
+
+        try:
+            upns = parse_pain_credit_transfers(payload)
+        except PainParseError:
+            log.debug("XML attachment %r is not a supported pain.001 message", filename)
+            continue
+        except Exception as exc:
+            log.warning("Failed to parse pain.001 attachment %r: %s", filename, exc)
+            continue
+
+        for index, upn in enumerate(upns, start=1):
+            if not upn.recipient_city:
+                upn = replace(upn, recipient_city=recipient_city)
+            key = (upn.recipient_iban, upn.recipient_reference)
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append((upn, f"{filename} (pain.001 #{index})"))
+
+    return results
+
+
 def extract_text_body(msg: email.message.Message) -> str:
     if msg.is_multipart():
         for part in msg.walk():
@@ -856,7 +926,7 @@ def _build_payment_text_block(payment: PaymentItem) -> list[str]:
 
     if payment.epc_payload:
         lines += ["", "  EPC payload (copy/paste fallback):"]
-        lines += [f"    {l}" for l in payment.epc_payload.splitlines()]
+        lines += [f"    {line}" for line in payment.epc_payload.splitlines()]
 
     if payment.conversion_error:
         lines += ["", f"  EPC QR: NOT GENERATED (reason: {payment.conversion_error})"]
@@ -924,6 +994,134 @@ def _build_payment_html_block(
     return epc_img + slip_img + pre
 
 
+def _payment_encoded_size(payment: PaymentItem) -> int:
+    """Approximate the bytes a payment adds to an email.
+
+    Each generated PNG is carried twice (inline CID preview + attachment) and
+    base64 inflates binary payloads by roughly 4/3.
+    """
+    raw = 0
+    if payment.epc_qr_png is not None:
+        raw += len(payment.epc_qr_png) * 2
+    if payment.upn_slip_png is not None:
+        raw += len(payment.upn_slip_png) * 2
+    return raw * 4 // 3
+
+
+def _original_attachments_size(original: email.message.Message) -> int:
+    """Approximate the base64-encoded size of preserved original attachments."""
+    total = 0
+    for part in original.walk():
+        if part.get_content_maintype() == "multipart":
+            continue
+        if part.get_content_type() in ("text/plain", "text/html"):
+            if part.get("Content-Disposition", "").strip().lower() != "attachment":
+                continue
+        payload = part.get_payload(decode=True)
+        if payload is not None:
+            total += len(payload) * 4 // 3
+    return total
+
+
+def plan_payment_batches(
+    payments: list[PaymentItem],
+    max_email_bytes: int,
+    first_batch_reserved: int,
+) -> list[list[PaymentItem]]:
+    """Split payments into batches that each fit within max_email_bytes.
+
+    The first batch also carries the preserved original attachments, so its
+    payment budget is reduced by first_batch_reserved. Each batch holds at least
+    one payment even if that single payment exceeds the budget.
+    """
+    if not payments:
+        return [[]]
+
+    batches: list[list[PaymentItem]] = []
+    current: list[PaymentItem] = []
+    current_size = 0
+    budget = max(0, max_email_bytes - first_batch_reserved)
+
+    for payment in payments:
+        size = _payment_encoded_size(payment)
+        if current and current_size + size > budget:
+            batches.append(current)
+            current = []
+            current_size = 0
+            budget = max_email_bytes
+        current.append(payment)
+        current_size += size
+
+    batches.append(current)
+    return batches
+
+
+def collect_payment_warnings(
+    payments: list[PaymentItem], extra_warnings: Optional[list[str]] = None
+) -> list[str]:
+    """Build the warning list shown atop a forward/reply."""
+    warnings: list[str] = list(extra_warnings or [])
+    for i, p in enumerate(payments, start=1):
+        src = ", ".join(p.sources) if p.sources else "?"
+        if p.reference_errors:
+            warnings.append(f"Payment {i} ({src}): invalid reference(s)")
+        if p.conversion_error:
+            warnings.append(f"Payment {i} ({src}): EPC QR not generated")
+    return warnings
+
+
+def payments_section_text(payments: list[PaymentItem]) -> list[str]:
+    """Plain-text payment blocks shared by forwards and replies."""
+    lines: list[str] = []
+    for i, payment in enumerate(payments, start=1):
+        src = ", ".join(payment.sources) if payment.sources else "(unknown source)"
+        lines += [f"Payment details {i} (found in: {src}):", ""]
+        lines += _build_payment_text_block(payment)
+        lines += [""]
+    return lines
+
+
+def payments_section_html(payments: list[PaymentItem]) -> list[str]:
+    """HTML payment blocks shared by forwards and replies."""
+    parts: list[str] = ["<h3>Payments</h3>"]
+    for i, payment in enumerate(payments, start=1):
+        cid = f"payment_{i}_epc_qr"
+        slip_cid = f"payment_{i}_upn_slip" if payment.upn_slip_png is not None else None
+        src = ", ".join(payment.sources) if payment.sources else "(unknown source)"
+        parts.append(f"<h4>Payment {i} (found in: {html.escape(src)})</h4>")
+        parts.append(_build_payment_html_block(payment, cid=cid, slip_cid=slip_cid))
+    return parts
+
+
+def attach_payment_artifacts(
+    related: MIMEMultipart,
+    container: MIMEMultipart,
+    payments: list[PaymentItem],
+) -> None:
+    """Attach inline CID previews to ``related`` and downloadable copies to ``container``."""
+    for i, payment in enumerate(payments, start=1):
+        if payment.epc_qr_png is not None:
+            inline = MIMEImage(payment.epc_qr_png, _subtype="png")
+            inline.add_header("Content-ID", f"<payment_{i}_epc_qr>")
+            inline.add_header("Content-Disposition", "inline", filename=f"payment_{i}_epc_qr.png")
+            related.attach(inline)
+        if payment.upn_slip_png is not None:
+            inline = MIMEImage(payment.upn_slip_png, _subtype="png")
+            inline.add_header("Content-ID", f"<payment_{i}_upn_slip>")
+            inline.add_header("Content-Disposition", "inline", filename=f"payment_{i}_upn_slip.png")
+            related.attach(inline)
+
+    for i, payment in enumerate(payments, start=1):
+        if payment.epc_qr_png is not None:
+            att = MIMEImage(payment.epc_qr_png, _subtype="png")
+            att.add_header("Content-Disposition", "attachment", filename=f"payment_{i}_epc_qr.png")
+            container.attach(att)
+        if payment.upn_slip_png is not None:
+            att = MIMEImage(payment.upn_slip_png, _subtype="png")
+            att.add_header("Content-Disposition", "attachment", filename=f"payment_{i}_upn_slip.png")
+            container.attach(att)
+
+
 def build_forward(
     original: email.message.Message,
     sender_addr: str,
@@ -935,13 +1133,19 @@ def build_forward(
     cc_admin: bool = False,
     extra_warnings: Optional[list[str]] = None,
     payments: list[PaymentItem],
+    include_originals: bool = True,
+    part_info: Optional[tuple[int, int]] = None,
 ) -> MIMEMultipart:
+    subject = "Fwd: " + original.get("Subject", "(no subject)")
+    if part_info is not None and part_info[1] > 1:
+        subject = f"{subject} (part {part_info[0]}/{part_info[1]})"
+
     fwd = MIMEMultipart("mixed")
     fwd["From"] = my_address
     if reply_to_sender:
         fwd["To"] = sender_addr
         fwd["Cc"] = admin_email
-        fwd["Subject"] = "Fwd: " + original.get("Subject", "(no subject)")
+        fwd["Subject"] = subject
     else:
         if to_addrs:
             fwd["To"] = ", ".join(to_addrs)
@@ -949,19 +1153,14 @@ def build_forward(
                 fwd["Cc"] = admin_email
         else:
             fwd["To"] = admin_email
-        fwd["Subject"] = "Fwd: " + original.get("Subject", "(no subject)")
+        fwd["Subject"] = subject
 
     # First part: multipart/related with text/plain + text/html and inline EPC QR images (CID).
     related = MIMEMultipart("related")
     alternative = MIMEMultipart("alternative")
     related.attach(alternative)
 
-    warnings: list[str] = list(extra_warnings or [])
-    for i, p in enumerate(payments, start=1):
-        if p.reference_errors:
-            warnings.append(f"Payment {i} ({', '.join(p.sources) if p.sources else '?'}): invalid reference(s)")
-        if p.conversion_error:
-            warnings.append(f"Payment {i} ({', '.join(p.sources) if p.sources else '?'}): EPC QR not generated")
+    warnings = collect_payment_warnings(payments, extra_warnings)
 
     # ── Plain text body ─────────────────────────────────────────────────────
     body_lines: list[str] = []
@@ -969,11 +1168,7 @@ def build_forward(
         body_lines += ["WARNINGS:", *[f"  - {w}" for w in warnings], ""]
 
     if payments:
-        for i, payment in enumerate(payments, start=1):
-            src = ", ".join(payment.sources) if payment.sources else "(unknown source)"
-            body_lines += [f"Payment details {i} (found in: {src}):", ""]
-            body_lines += _build_payment_text_block(payment)
-            body_lines += [""]
+        body_lines += payments_section_text(payments)
 
     body_lines += [
         "-------- Forwarded message --------",
@@ -996,13 +1191,7 @@ def build_forward(
         html_parts.append("</ul>")
 
     if payments:
-        html_parts.append("<h3>Payments</h3>")
-        for i, payment in enumerate(payments, start=1):
-            cid = f"payment_{i}_epc_qr"
-            slip_cid = f"payment_{i}_upn_slip" if payment.upn_slip_png is not None else None
-            src = ", ".join(payment.sources) if payment.sources else "(unknown source)"
-            html_parts.append(f"<h4>Payment {i} (found in: {html.escape(src)})</h4>")
-            html_parts.append(_build_payment_html_block(payment, cid=cid, slip_cid=slip_cid))
+        html_parts += payments_section_html(payments)
 
     html_parts.append("<hr />")
     html_parts.append("<pre>")
@@ -1021,39 +1210,12 @@ def build_forward(
         )
     )
 
-    # Inline images for HTML via CID.
-    for i, payment in enumerate(payments, start=1):
-        if payment.epc_qr_png is not None:
-            img_part = MIMEImage(payment.epc_qr_png, _subtype="png")
-            img_part.add_header("Content-ID", f"<payment_{i}_epc_qr>")
-            img_part.add_header("Content-Disposition", "inline", filename=f"payment_{i}_epc_qr.png")
-            related.attach(img_part)
-        if payment.upn_slip_png is not None:
-            slip_part = MIMEImage(payment.upn_slip_png, _subtype="png")
-            slip_part.add_header("Content-ID", f"<payment_{i}_upn_slip>")
-            slip_part.add_header("Content-Disposition", "inline", filename=f"payment_{i}_upn_slip.png")
-            related.attach(slip_part)
-
     fwd.attach(related)
-
-    # ── EPC QR and UPN slip attachments ──────────────────────────────────────
-    for i, payment in enumerate(payments, start=1):
-        if payment.epc_qr_png is not None:
-            img_part = MIMEImage(payment.epc_qr_png, _subtype="png")
-            img_part.add_header(
-                "Content-Disposition", "attachment",
-                filename=f"payment_{i}_epc_qr.png",
-            )
-            fwd.attach(img_part)
-        if payment.upn_slip_png is not None:
-            slip_part = MIMEImage(payment.upn_slip_png, _subtype="png")
-            slip_part.add_header(
-                "Content-Disposition", "attachment",
-                filename=f"payment_{i}_upn_slip.png",
-            )
-            fwd.attach(slip_part)
+    attach_payment_artifacts(related, fwd, payments)
 
     # ── Original attachments (preserved) ─────────────────────────────────────
+    if not include_originals:
+        return fwd
     for part in original.walk():
         # Skip container parts and plain-text/html body parts
         if part.get_content_maintype() == "multipart":
@@ -1110,39 +1272,6 @@ def _build_smtp_tls_context() -> ssl.SSLContext:
     return ssl.create_default_context()
 
 
-def _load_gmail_config() -> Optional[GmailConfig]:
-    service_account_file = os.environ.get("GMAIL_SERVICE_ACCOUNT_FILE", "").strip()
-    impersonate_address = os.environ.get("GMAIL_IMPERSONATE_ADDRESS", "").strip()
-    if not service_account_file or not impersonate_address:
-        return None
-    return GmailConfig(
-        service_account_file=service_account_file,
-        impersonate_address=impersonate_address,
-    )
-
-
-def send_mail_via_gmail_api(
-    fwd: MIMEMultipart,
-    recipients: list[str],
-    gmail_cfg: GmailConfig,
-) -> None:
-    from google.oauth2 import service_account
-    from googleapiclient.discovery import build
-
-    creds = service_account.Credentials.from_service_account_file(
-        gmail_cfg.service_account_file,
-        scopes=["https://www.googleapis.com/auth/gmail.send"],
-    ).with_subject(gmail_cfg.impersonate_address)
-    service = build("gmail", "v1", credentials=creds, cache_discovery=False)
-
-    raw = base64.urlsafe_b64encode(fwd.as_bytes()).decode("ascii")
-    service.users().messages().send(
-        userId="me",
-        body={"raw": raw},
-    ).execute()
-    log.debug("Gmail API: sent to %s", recipients)
-
-
 def scan_message_for_payments(
     msg: email.message.Message,
     *,
@@ -1166,6 +1295,8 @@ def scan_message_for_payments(
         log.info("eSLOG XML payment candidates: %d", len(eslog_upns))
         envelope_upns = scan_icl_envelopes_for_payments(msg, max_bytes)
         log.info("e-račun envelope payment candidates: %d", len(envelope_upns))
+        pain_upns = scan_pain_xml_for_payments(msg, max_bytes)
+        log.info("pain.001 payment candidates: %d", len(pain_upns))
         qr_results = scan_attachments(msg, max_bytes)
         log.info("QR codes found (raw): %d", len(qr_results))
         qr_unique = dedupe_qr_results(qr_results)
@@ -1177,6 +1308,7 @@ def scan_message_for_payments(
             eslog_upns,
             qr_payments,
             envelope_upns,
+            pain_upns,
         )
         log.info("Merged payment items: %d", len(payments))
     except MessageProcessingTimeout as exc:
@@ -1196,13 +1328,9 @@ def _send_mail(
     my_address: str,
     recipients: list[str],
     smtp_cfg: Optional[SmtpConfig],
-    gmail_cfg: Optional[GmailConfig],
 ) -> None:
-    """Send the forwarded message via Gmail API, sendmail, or SMTP."""
+    """Send the forwarded message via sendmail or SMTP."""
     msg_bytes = fwd.as_bytes()
-    if gmail_cfg is not None:
-        send_mail_via_gmail_api(fwd, recipients, gmail_cfg)
-        return
     if smtp_cfg is None:
         # Inject via sendmail binary — queues directly into Postfix spool,
         # no live SMTP connection needed. On NixOS: /run/wrappers/bin/sendmail
@@ -1279,18 +1407,6 @@ def main() -> None:
             to_addrs = routed
             cc_admin = True
 
-    fwd = build_forward(
-        msg,
-        sender_addr,
-        my_address,
-        admin_email,
-        reply_to_sender=is_trusted,
-        to_addrs=to_addrs,
-        cc_admin=cc_admin,
-        extra_warnings=extra_warnings,
-        payments=payments,
-    )
-
     if is_trusted:
         recipients = [sender_addr, admin_email]
     elif to_addrs:
@@ -1299,7 +1415,31 @@ def main() -> None:
         recipients = [admin_email]
 
     recipients = list(dict.fromkeys(recipients))  # dedupe, preserve order
-    _send_mail(fwd, my_address, recipients, _load_smtp_config(), _load_gmail_config())
+
+    max_email_bytes = int(os.environ.get("MAX_EMAIL_BYTES", DEFAULT_MAX_EMAIL_BYTES))
+    batches = plan_payment_batches(
+        payments, max_email_bytes, _original_attachments_size(msg)
+    )
+    total_parts = len(batches)
+    if total_parts > 1:
+        log.info("Splitting forward into %d emails (limit %d bytes)", total_parts, max_email_bytes)
+
+    smtp_cfg = _load_smtp_config()
+    for index, batch in enumerate(batches, start=1):
+        fwd = build_forward(
+            msg,
+            sender_addr,
+            my_address,
+            admin_email,
+            reply_to_sender=is_trusted,
+            to_addrs=to_addrs,
+            cc_admin=cc_admin,
+            extra_warnings=extra_warnings if index == 1 else None,
+            payments=batch,
+            include_originals=(index == 1),
+            part_info=(index, total_parts),
+        )
+        _send_mail(fwd, my_address, recipients, smtp_cfg)
 
 
 def _silence_std_streams_on_exit() -> None:

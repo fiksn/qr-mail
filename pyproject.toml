@@ -16,6 +16,7 @@ dependencies = [
     "cryptography>=43",   # X.509 parsing + RSA signature verification
     "google-api-python-client>=2.190", # Gmail API
     "google-auth>=2.40",  # service-account credentials
+    "google-auth-oauthlib>=1.2",  # single-user OAuth consent flow
 ]
 
 [dependency-groups]

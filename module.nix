@@ -14,6 +14,7 @@ let
     ps.cryptography # X.509 cert parsing + RSA signature verification
     ps.google-api-python-client # Gmail API (gmail_fetch.py)
     ps.google-auth # service account credentials
+    ps.google-auth-oauthlib # single-user OAuth consent flow
   ]);
 
   # Bundle the Python packages and scripts into one store path.
@@ -31,19 +32,18 @@ let
   monoFontRegular = "${pkgs.liberation_ttf}/share/fonts/truetype/LiberationMono-Regular.ttf";
   monoFontBold = "${pkgs.liberation_ttf}/share/fonts/truetype/LiberationMono-Bold.ttf";
 
-  # Shell wrapper that sets env vars and invokes the Python script.
+  # Environment shared by the Postfix processor and the in-process Gmail daemon.
   # pdf2image calls pdftoppm at runtime, so poppler_utils must be on PATH.
-  processorBin = pkgs.writeShellScriptBin "qr-mail-processor" ''
+  scanEnv = ''
     export PATH="/run/wrappers/bin:${pkgs.poppler-utils}/bin:${pkgs.tesseract}/bin:$PATH"
     export PYTHONPATH=${src}
     export QR_MAIL_MONO_FONT_REGULAR=${monoFontRegular}
     export QR_MAIL_MONO_FONT_BOLD=${monoFontBold}
-    export ADMIN_EMAIL=${lib.escapeShellArg cfg.adminEmail}
     export MY_ADDRESS=${lib.escapeShellArg cfg.myAddress}
     export ALLOWED_SENDERS=${lib.escapeShellArg (lib.concatStringsSep ":" cfg.allowedSenders)}
-    export ALLOWED_SENDER_ROUTES=${lib.escapeShellArg (lib.concatStringsSep ":" cfg.allowedSenderRoutes)}
     export TRUSTED_SENDERS=${lib.escapeShellArg (lib.concatStringsSep ":" cfg.trustedSenders)}
     export MAX_ATTACHMENT_BYTES=${toString cfg.maxAttachmentBytes}
+    export MAX_EMAIL_BYTES=${toString cfg.maxEmailBytes}
     export EPC_TO_UPN_CITY=${lib.escapeShellArg cfg.epcToUpnCity}
     export MAX_PDF_PAGES=${toString cfg.maxPdfPages}
     export PDF_RENDER_DPI=${toString cfg.pdfRenderDpi}
@@ -51,23 +51,31 @@ let
     export PDFINFO_TIMEOUT_S=${toString cfg.pdfinfoTimeoutSeconds}
     export MAX_IMAGE_PIXELS=${toString cfg.maxImagePixels}
     export MAX_MESSAGE_RUNTIME_S=${toString cfg.maxMessageRuntimeSeconds}
+    export ESLOG_TRUSTED_CERTS_FILE=${lib.escapeShellArg cfg.eslogTrustedCertsFile}
+  '';
+  # Shell wrapper for the Postfix pipe processor (forward + send path).
+  processorBin = pkgs.writeShellScriptBin "qr-mail-processor" ''
+    ${scanEnv}
+    export ADMIN_EMAIL=${lib.escapeShellArg cfg.adminEmail}
+    export ALLOWED_SENDER_ROUTES=${lib.escapeShellArg (lib.concatStringsSep ":" cfg.allowedSenderRoutes)}
     export SMTP_HOST=${lib.escapeShellArg cfg.smtpHost}
     export SMTP_PORT=${toString cfg.smtpPort}
     export SMTP_USER=${lib.escapeShellArg cfg.smtpUser}
     export SMTP_PASSWORD=${lib.escapeShellArg cfg.smtpPassword}
     export SMTP_TLS=${lib.escapeShellArg cfg.smtpTls}
     export SMTP_INSECURE_SKIP_VERIFY=${lib.boolToString cfg.smtpInsecureSkipVerify}
-    export ESLOG_TRUSTED_CERTS_FILE=${lib.escapeShellArg cfg.eslogTrustedCertsFile}
     exec ${python}/bin/python3 ${src}/scripts/mail_processor.py "$@"
   '';
+  # In-process Gmail daemon: fetch from allowed senders, insert QR replies.
+  # Secret file paths (service account / OAuth) are injected at runtime via the
+  # systemd unit so they never land in the Nix store.
   gmailFetcherBin = pkgs.writeShellScriptBin "qr-mail-gmail-fetch" ''
-    export PYTHONPATH=${src}
+    ${scanEnv}
     export GMAIL_IMPERSONATE_ADDRESS=${lib.escapeShellArg cfg.gmailImpersonateAddress}
     export GMAIL_POLL_INTERVAL_S=${toString cfg.gmailPollIntervalSeconds}
     export GMAIL_PROCESSED_LABEL=${lib.escapeShellArg cfg.gmailProcessedLabel}
-    export PROCESSOR_BIN=${processorBin}/bin/qr-mail-processor
-    # Service account file path is passed at runtime via GMAIL_SERVICE_ACCOUNT_FILE
-    # so that the secret never lands in the Nix store.
+    export GMAIL_FAILED_LABEL=${lib.escapeShellArg cfg.gmailFailedLabel}
+    export GMAIL_MAX_ATTEMPTS=${toString cfg.gmailMaxAttempts}
     exec ${python}/bin/python3 ${src}/scripts/gmail_fetch.py "$@"
   '';
 in
@@ -134,6 +142,16 @@ in
       type = lib.types.int;
       default = 104857600; # 100 MB
       description = "Maximum size in bytes of a single attachment to scan for QR codes.";
+    };
+
+    maxEmailBytes = lib.mkOption {
+      type = lib.types.int;
+      default = 20971520; # 20 MB
+      description = ''
+        Split a forwarded message into multiple emails when the generated
+        payment artifacts (EPC QR codes and UPN slips) would exceed this size.
+        Useful for ISO 20022 pain.001 batches that produce many payments.
+      '';
     };
 
     maxPdfPages = lib.mkOption {
@@ -271,14 +289,37 @@ in
       example = "/run/secrets/qr-mail-service-account.json";
       description = ''
         Path to a Google service account JSON key file with domain-wide
-        delegation enabled for the Gmail API. When set, a polling daemon
-        (<literal>qr-mail-gmail-fetch</literal>) is started and outbound mail
-        is sent through the Gmail API using the same impersonated mailbox,
-        instead of Postfix/sendmail or SMTP.
+        delegation enabled for the Gmail API. Selects domain-wide-delegation
+        mode: a polling daemon (<literal>qr-mail-gmail-fetch</literal>) reads
+        the impersonated mailbox and inserts QR replies into matching
+        conversations, instead of using Postfix/sendmail or SMTP.
 
         The file must be readable by the <literal>qr-mail</literal> system
         user. Use a secrets manager (e.g. sops-nix) so the key does not land
         in the Nix store.
+      '';
+    };
+
+    gmailOauthClientSecretFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      example = "/run/secrets/qr-mail-oauth-client.json";
+      description = ''
+        Path to an OAuth client-secret JSON for single-user mode. Only needed
+        for the one-time consent flow (<literal>scripts/gmail_authorize.py</literal>)
+        that produces the token file; the running daemon uses the token alone.
+      '';
+    };
+
+    gmailOauthTokenFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      example = "/var/lib/qr-mail/gmail-token.json";
+      description = ''
+        Path to the cached OAuth token JSON for single-user mode. Selects OAuth
+        mode when <option>gmailServiceAccountFile</option> is unset. The daemon
+        refreshes and rewrites this file, so its directory must be writable by
+        the <literal>qr-mail</literal> user.
       '';
     };
 
@@ -287,9 +328,9 @@ in
       default = "";
       example = "qr@yourdomain.com";
       description = ''
-        Google Workspace address the service account impersonates via
-        domain-wide delegation. Must match the inbox that receives payment
-        mail.
+        Mailbox the Gmail daemon reads and inserts replies into. In
+        domain-wide-delegation mode it is the address impersonated by the
+        service account; in OAuth mode it is the user that granted consent.
       '';
     };
 
@@ -308,59 +349,104 @@ in
         It is hidden from the label list to keep the inbox tidy.
       '';
     };
+
+    gmailFailedLabel = lib.mkOption {
+      type = lib.types.str;
+      default = "qr-mail-failed";
+      description = ''
+        Gmail label applied to a message that fails processing
+        <option>gmailMaxAttempts</option> times. Labelled messages are excluded
+        from future polls so a single poison message cannot loop forever.
+      '';
+    };
+
+    gmailMaxAttempts = lib.mkOption {
+      type = lib.types.int;
+      default = 3;
+      description = ''
+        Number of times the daemon retries a message before labelling it failed
+        and giving up. Guards against persistently failing (poison) messages.
+      '';
+    };
   };
 
-  config = lib.mkIf cfg.enable {
-    users.users.qr-mail = {
-      isSystemUser = true;
-      group = "qr-mail";
-      description = "qr-mail Postfix pipe user";
-    };
-    users.groups.qr-mail = { };
-
-    services.postfix.settings.master."qr-mail" = lib.mkIf (cfg.gmailServiceAccountFile == null) {
-      type = "unix";
-      privileged = true;
-      chroot = false;
-      command = "pipe";
-      args = [
-        "flags=Rq"
-        "user=qr-mail"
-        "argv=${processorBin}/bin/qr-mail-processor" "\${sender}"
+  config =
+    let
+      # Gmail mode is active when either auth method is configured. It takes
+      # over delivery from the Postfix pipe.
+      gmailMode = cfg.gmailServiceAccountFile != null || cfg.gmailOauthTokenFile != null;
+      gmailSecretEnv = lib.filter (x: x != null) [
+        (lib.optionalString (cfg.gmailServiceAccountFile != null)
+          "GMAIL_SERVICE_ACCOUNT_FILE=${cfg.gmailServiceAccountFile}")
+        (lib.optionalString (cfg.gmailOauthClientSecretFile != null)
+          "GMAIL_OAUTH_CLIENT_SECRET_FILE=${cfg.gmailOauthClientSecretFile}")
+        (lib.optionalString (cfg.gmailOauthTokenFile != null)
+          "GMAIL_OAUTH_TOKEN_FILE=${cfg.gmailOauthTokenFile}")
       ];
-    };
+      gmailReadOnly = lib.filter (x: x != null) [
+        cfg.gmailServiceAccountFile
+        cfg.gmailOauthClientSecretFile
+      ];
+    in
+    lib.mkIf cfg.enable {
+      users.users.qr-mail = {
+        isSystemUser = true;
+        group = "qr-mail";
+        description = "qr-mail Postfix pipe user";
+      };
+      users.groups.qr-mail = { };
 
-    mailserver.extraVirtualAliases =
-      lib.mkIf (cfg.catchAllWorkaround && cfg.gmailServiceAccountFile == null) {
-        "${cfg.myAddress}" = "qr-mail-pipe@localhost";
+      services.postfix.settings.master."qr-mail" = lib.mkIf (!gmailMode) {
+        type = "unix";
+        privileged = true;
+        chroot = false;
+        command = "pipe";
+        args = [
+          "flags=Rq"
+          "user=qr-mail"
+          "argv=${processorBin}/bin/qr-mail-processor" "\${sender}"
+        ];
       };
 
-    services.postfix.transport = lib.mkIf (cfg.gmailServiceAccountFile == null)
-      (if cfg.catchAllWorkaround
-       then "qr-mail-pipe@localhost  qr-mail:\n"
-       else "${cfg.myAddress}  qr-mail:\n");
+      mailserver.extraVirtualAliases =
+        lib.mkIf (cfg.catchAllWorkaround && !gmailMode) {
+          "${cfg.myAddress}" = "qr-mail-pipe@localhost";
+        };
 
-    systemd.services.qr-mail-gmail-fetch = lib.mkIf (cfg.gmailServiceAccountFile != null) {
-      description = "qr-mail Gmail fetch daemon";
-      after = [ "network-online.target" ];
-      wants = [ "network-online.target" ];
-      wantedBy = [ "multi-user.target" ];
-      serviceConfig = {
-        Type = "simple";
-        User = "qr-mail";
-        Group = "qr-mail";
-        ExecStart = "${gmailFetcherBin}/bin/qr-mail-gmail-fetch";
-        # Service account file is injected here so it never enters the Nix store.
-        Environment = "GMAIL_SERVICE_ACCOUNT_FILE=${cfg.gmailServiceAccountFile}";
-        Restart = "on-failure";
-        RestartSec = "30s";
-        # Hardening
-        NoNewPrivileges = true;
-        PrivateTmp = true;
-        ProtectSystem = "strict";
-        ProtectHome = true;
-        ReadOnlyPaths = [ cfg.gmailServiceAccountFile ];
+      services.postfix.transport = lib.mkIf (!gmailMode)
+        (if cfg.catchAllWorkaround
+         then "qr-mail-pipe@localhost  qr-mail:\n"
+         else "${cfg.myAddress}  qr-mail:\n");
+
+      systemd.services.qr-mail-gmail-fetch = lib.mkIf gmailMode {
+        description = "qr-mail Gmail fetch daemon";
+        after = [ "network-online.target" ];
+        wants = [ "network-online.target" ];
+        wantedBy = [ "multi-user.target" ];
+        serviceConfig = {
+          Type = "simple";
+          User = "qr-mail";
+          Group = "qr-mail";
+          ExecStart = "${gmailFetcherBin}/bin/qr-mail-gmail-fetch";
+          # Secret file paths are injected here so they never enter the Nix store.
+          Environment = gmailSecretEnv;
+          Restart = "on-failure";
+          RestartSec = "30s";
+          # Creates /var/lib/qr-mail (0700, owned by qr-mail) — the recommended
+          # home for the refreshable OAuth token.
+          StateDirectory = "qr-mail";
+          StateDirectoryMode = "0700";
+          # Hardening
+          NoNewPrivileges = true;
+          PrivateTmp = true;
+          ProtectSystem = "strict";
+          ProtectHome = true;
+          ReadOnlyPaths = gmailReadOnly;
+          # The OAuth token is refreshed and rewritten in place, so its
+          # directory must stay writable.
+          ReadWritePaths =
+            lib.optional (cfg.gmailOauthTokenFile != null) (builtins.dirOf cfg.gmailOauthTokenFile);
+        };
       };
     };
-  };
 }

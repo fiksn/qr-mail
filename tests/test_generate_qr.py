@@ -13,7 +13,6 @@ from scripts.generate_qr import (
     load_payee_defaults_from_env,
     load_payee_template_from_env,
     load_payer_defaults_from_env,
-    load_payer_template_from_env,
     load_party_defaults_from_env,
 )
 

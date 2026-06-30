@@ -1,113 +1,93 @@
 #!/usr/bin/env python3
-"""
-Gmail polling daemon: fetches unread inbox messages and pipes each one to
-the qr-mail processor, then marks it processed.
+"""Gmail polling daemon: fetch new mail from allowed senders and insert QR replies.
 
-Uses a service account with domain-wide delegation (Google Workspace).
+Periodically searches the mailbox for unread messages from configured senders,
+scans each for payment data, and — when any is found — inserts an artificial
+reply carrying the EPC QR codes into the same conversation. Messages with no
+payment data are marked processed but get no reply.
+
+Works with either auth mode (auto-detected, see scripts/gmail_client.py):
+  - single-user OAuth (GMAIL_OAUTH_TOKEN_FILE), or
+  - service account + domain-wide delegation (GMAIL_SERVICE_ACCOUNT_FILE).
 
 Configuration via environment variables:
-  GMAIL_SERVICE_ACCOUNT_FILE   path to service_account.json (required)
-  GMAIL_IMPERSONATE_ADDRESS    Gmail address to impersonate (required)
-  GMAIL_POLL_INTERVAL_S        seconds between polls (default: 60)
-  GMAIL_PROCESSED_LABEL        label applied after processing (default: qr-mail-processed)
-  PROCESSOR_BIN                processor executable path (default: qr-mail-processor)
+  MY_ADDRESS                  From: address of the inserted replies (required)
+  ALLOWED_SENDERS             colon-separated sender globs, e.g. "*@trusted.com"
+  TRUSTED_SENDERS             additional sender globs (same effect here)
+  GMAIL_IMPERSONATE_ADDRESS   mailbox to read and insert into (required)
+  GMAIL_SERVICE_ACCOUNT_FILE / GMAIL_OAUTH_TOKEN_FILE / GMAIL_OAUTH_CLIENT_SECRET_FILE
+  GMAIL_POLL_INTERVAL_S       seconds between polls (default: 60)
+  GMAIL_PROCESSED_LABEL       label applied after handling (default: qr-mail-processed)
+  GMAIL_FAILED_LABEL          label applied after repeated failures (default: qr-mail-failed)
+  GMAIL_MAX_ATTEMPTS          retries before giving up on a message (default: 3)
+  MAX_EMAIL_BYTES             split replies past this size (default: 20 MB)
 
-The processor binary is invoked as a subprocess and receives the raw RFC 2822
-message on stdin. Unlike the Postfix path, Gmail does not provide a trustworthy
-envelope sender to the processor, so the processor must derive a verified sender
-from authentication headers within the message.
-All ADMIN_EMAIL / MY_ADDRESS / ALLOWED_SENDERS etc. must be set in the
-processor's own environment (the NixOS module handles this via its shell wrapper).
+The Gmail search is scoped to the configured senders so the daemon never touches
+unrelated mail — important when running against a single user's own mailbox.
 """
-import base64
+from __future__ import annotations
+
 import logging
 import os
-import subprocess
 import sys
 import time
 
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
+if __package__ in {None, ""}:
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from googleapiclient.errors import HttpError
 
-SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
+from core.routing import parse_allowed_senders
+from scripts.gmail_client import GmailClient, GmailConfigError, load_gmail_config
+from scripts.gmail_reply import gmail_from_clause, process_message
+from scripts.mail_processor import (
+    DEFAULT_MAX_ATTACHMENT_BYTES,
+    DEFAULT_MAX_EMAIL_BYTES,
+    DEFAULT_MAX_MESSAGE_RUNTIME_S,
+)
 
 DEFAULT_POLL_INTERVAL_S = 60
 DEFAULT_PROCESSED_LABEL = "qr-mail-processed"
+DEFAULT_FAILED_LABEL = "qr-mail-failed"
+DEFAULT_MAX_ATTEMPTS = 3
+MAX_PER_POLL = 50
 
 log = logging.getLogger(__name__)
 
 
-def _build_service(service_account_file: str, impersonate: str):
-    creds = service_account.Credentials.from_service_account_file(
-        service_account_file, scopes=SCOPES
-    ).with_subject(impersonate)
-    # cache_discovery=False avoids writing to /tmp in restricted systemd environments.
-    return build("gmail", "v1", credentials=creds, cache_discovery=False)
+def record_failure(
+    client: GmailClient,
+    msg_id: str,
+    attempts: dict[str, int],
+    *,
+    failed_label_id: str,
+    failed_label: str,
+    max_attempts: int,
+    exc: Exception,
+) -> None:
+    """Count a per-message failure; label it failed once retries are exhausted."""
+    attempts[msg_id] = attempts.get(msg_id, 0) + 1
+    if attempts[msg_id] >= max_attempts:
+        log.error(
+            "message %s failed %d time(s); labelling %r and giving up: %s",
+            msg_id, attempts[msg_id], failed_label, exc,
+        )
+        try:
+            client.add_label(msg_id, failed_label_id)
+        except HttpError as label_exc:
+            log.error("could not label %s failed: %s", msg_id, label_exc)
+        attempts.pop(msg_id, None)
+    else:
+        log.warning(
+            "message %s failed (attempt %d/%d); will retry: %s",
+            msg_id, attempts[msg_id], max_attempts, exc,
+        )
 
 
-def _get_or_create_label(service, label_name: str) -> str:
-    """Return the label ID, creating the label if it does not exist."""
-    result = service.users().labels().list(userId="me").execute()
-    for label in result.get("labels", []):
-        if label["name"] == label_name:
-            return label["id"]
-    created = service.users().labels().create(
-        userId="me",
-        body={
-            "name": label_name,
-            # Hidden from label list and message list to keep inbox tidy.
-            "labelListVisibility": "labelHide",
-            "messageListVisibility": "hide",
-        },
-    ).execute()
-    log.info("Created Gmail label %r (id=%s)", label_name, created["id"])
-    return created["id"]
-
-
-def _list_unread_ids(service) -> list[str]:
-    """Return IDs of unread INBOX messages (up to 50 per poll)."""
-    result = service.users().messages().list(
-        userId="me",
-        labelIds=["INBOX", "UNREAD"],
-        maxResults=50,
-    ).execute()
-    return [m["id"] for m in result.get("messages", [])]
-
-
-def _fetch_raw(service, msg_id: str) -> bytes:
-    msg = service.users().messages().get(
-        userId="me", id=msg_id, format="raw"
-    ).execute()
-    return base64.urlsafe_b64decode(msg["raw"] + "==")
-
-
-def _mark_processed(service, msg_id: str, processed_label_id: str) -> None:
-    service.users().messages().modify(
-        userId="me",
-        id=msg_id,
-        body={
-            "addLabelIds": [processed_label_id],
-            "removeLabelIds": ["UNREAD"],
-        },
-    ).execute()
-
-
-def _run_processor(raw: bytes, processor_bin: str) -> bool:
-    """Pipe raw RFC 2822 bytes to the processor. Returns True on success."""
-    child_env = dict(os.environ)
-    child_env["QRMAIL_SENDER_SOURCE"] = "gmail-headers"
-    result = subprocess.run(
-        [processor_bin], input=raw, capture_output=True, env=child_env,
-    )
-    if result.stderr:
-        # Processor logs to stderr; relay at debug level to avoid double-logging.
-        for line in result.stderr.decode(errors="replace").splitlines():
-            log.debug("processor: %s", line)
-    if result.returncode != 0:
-        log.error("Processor exited %d", result.returncode)
-        return False
-    return True
+def _load_senders() -> list[str]:
+    allowed = [p for p in os.environ.get("ALLOWED_SENDERS", "").split(":") if p]
+    trusted = [p for p in os.environ.get("TRUSTED_SENDERS", "").split(":") if p]
+    return parse_allowed_senders(allowed + trusted)
 
 
 def main() -> None:
@@ -117,45 +97,91 @@ def main() -> None:
         format="qr-mail-gmail: %(levelname)s %(message)s",
     )
 
-    sa_file = os.environ.get("GMAIL_SERVICE_ACCOUNT_FILE", "").strip()
-    impersonate = os.environ.get("GMAIL_IMPERSONATE_ADDRESS", "").strip()
-    if not sa_file or not impersonate:
+    try:
+        cfg = load_gmail_config()
+    except GmailConfigError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if cfg is None:
         print(
-            "ERROR: GMAIL_SERVICE_ACCOUNT_FILE and GMAIL_IMPERSONATE_ADDRESS are required",
+            "ERROR: no Gmail credentials configured "
+            "(set GMAIL_SERVICE_ACCOUNT_FILE or GMAIL_OAUTH_TOKEN_FILE)",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    processor_bin = os.environ.get("PROCESSOR_BIN", "qr-mail-processor").strip()
+    my_address = os.environ.get("MY_ADDRESS", "").strip()
+    if not my_address:
+        print("ERROR: MY_ADDRESS is required", file=sys.stderr)
+        sys.exit(1)
+
+    senders = _load_senders()
+    if not senders:
+        print("ERROR: no senders configured (ALLOWED_SENDERS / TRUSTED_SENDERS)", file=sys.stderr)
+        sys.exit(1)
+
     poll_interval = int(os.environ.get("GMAIL_POLL_INTERVAL_S", DEFAULT_POLL_INTERVAL_S))
-    processed_label_name = os.environ.get("GMAIL_PROCESSED_LABEL", DEFAULT_PROCESSED_LABEL)
+    processed_label = os.environ.get("GMAIL_PROCESSED_LABEL", DEFAULT_PROCESSED_LABEL)
+    failed_label = os.environ.get("GMAIL_FAILED_LABEL", DEFAULT_FAILED_LABEL)
+    max_attempts = int(os.environ.get("GMAIL_MAX_ATTEMPTS", DEFAULT_MAX_ATTEMPTS))
+    max_email_bytes = int(os.environ.get("MAX_EMAIL_BYTES", DEFAULT_MAX_EMAIL_BYTES))
+    max_attachment_bytes = int(os.environ.get("MAX_ATTACHMENT_BYTES", DEFAULT_MAX_ATTACHMENT_BYTES))
+    max_runtime_s = int(os.environ.get("MAX_MESSAGE_RUNTIME_S", DEFAULT_MAX_MESSAGE_RUNTIME_S))
 
     log.info(
-        "Starting (impersonating=%s, poll=%ds, label=%r)",
-        impersonate, poll_interval, processed_label_name,
+        "Starting (mode=%s, mailbox=%s, poll=%ds, label=%r)",
+        cfg.auth_mode, cfg.user, poll_interval, processed_label,
     )
 
-    service = _build_service(sa_file, impersonate)
-    processed_label_id = _get_or_create_label(service, processed_label_name)
-    log.info("Processed label id=%s", processed_label_id)
+    client = GmailClient(cfg)
+    label_id = client.get_or_create_label(processed_label)
+    failed_label_id = client.get_or_create_label(failed_label)
+
+    from_clause = gmail_from_clause(senders)
+    if not from_clause:
+        log.warning(
+            "Sender patterns are not expressible as a Gmail query; "
+            "all unread mail will be examined (verification still applies)"
+        )
+    # Exclude both processed and permanently-failed messages from future polls.
+    query = f"is:unread -label:{processed_label} -label:{failed_label} {from_clause}".strip()
+    log.info("Gmail query: %s", query)
+
+    # Per-message failure counts (in-memory). A message that keeps throwing is
+    # labelled failed after max_attempts so it stops being re-fetched forever.
+    attempts: dict[str, int] = {}
 
     while True:
         try:
-            msg_ids = _list_unread_ids(service)
-            if msg_ids:
-                log.info("Found %d unread message(s)", len(msg_ids))
-            for msg_id in msg_ids:
+            for msg_id, thread_id in client.search(query, max_results=MAX_PER_POLL):
                 try:
-                    raw = _fetch_raw(service, msg_id)
-                    ok = _run_processor(raw, processor_bin)
-                    if ok:
-                        _mark_processed(service, msg_id, processed_label_id)
-                        log.info("Processed message %s", msg_id)
+                    raw = client.get_raw_message(msg_id)
+                    status = process_message(
+                        client,
+                        raw,
+                        my_address=my_address,
+                        allowed_patterns=senders,
+                        thread_id=thread_id,
+                        strict_sender=True,
+                        max_email_bytes=max_email_bytes,
+                        max_attachment_bytes=max_attachment_bytes,
+                        max_runtime_s=max_runtime_s,
+                    )
+                    if status == "skipped-sender":
+                        # Could not verify the sender — flag handled but leave unread.
+                        client.add_label(msg_id, label_id)
                     else:
-                        # Leave unread so it is retried on the next poll.
-                        log.warning("Processing failed for %s; will retry", msg_id)
-                except HttpError as exc:
-                    log.error("Gmail API error on message %s: %s", msg_id, exc)
+                        client.mark_processed(msg_id, label_id)
+                    attempts.pop(msg_id, None)
+                    log.info("message %s: %s", msg_id, status)
+                except Exception as exc:  # noqa: BLE001
+                    record_failure(
+                        client, msg_id, attempts,
+                        failed_label_id=failed_label_id,
+                        failed_label=failed_label,
+                        max_attempts=max_attempts,
+                        exc=exc,
+                    )
         except HttpError as exc:
             log.error("Gmail API error during poll: %s", exc)
         except Exception as exc:  # noqa: BLE001

@@ -755,7 +755,6 @@ def generate_upn_slip_png(
 
     font_small = _load_font(13, bold=True)
     font_main = _load_font(14, bold=True)
-    font_main_bold = _load_font(14, bold=True)
     font_boxed = _load_font(13, bold=True)
     font_amount = _load_font(17, bold=True)
 
