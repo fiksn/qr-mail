@@ -16,6 +16,7 @@ https://www.iso20022.org/iso-20022-message-definitions
 """
 from __future__ import annotations
 
+import logging
 from datetime import date
 from decimal import Decimal, InvalidOperation
 
@@ -23,6 +24,12 @@ import defusedxml.ElementTree as ET
 
 from core.epc import EPCParseError, _validate_iban
 from core.upn import UPN
+
+# EPC SCT QR codes carry EUR only, so non-EUR transactions are skipped rather
+# than silently relabelled as euros.
+EUR = "EUR"
+
+log = logging.getLogger(__name__)
 
 
 class PainParseError(ValueError):
@@ -141,6 +148,19 @@ def _remittance(tx: ET.Element) -> tuple[str, str]:
     return (reference, purpose)
 
 
+def _instructed_amount(tx: ET.Element) -> tuple[int, str]:
+    """Return (amount_cents, currency) from Amt/InstdAmt.
+
+    Currency is uppercased; empty when the (schema-mandatory) Ccy attribute is
+    absent, in which case EUR is assumed by the caller.
+    """
+    node = _descend(tx, "Amt", "InstdAmt")
+    if node is None:
+        return (0, "")
+    currency = (node.get("Ccy") or "").strip().upper()
+    return (_parse_amount_cents((node.text or "").strip()), currency)
+
+
 def _transaction_to_upn(
     tx: ET.Element,
     *,
@@ -149,7 +169,7 @@ def _transaction_to_upn(
     payer_city: str,
     payer_iban: str,
     execution_date: date | None,
-) -> UPN:
+) -> UPN | None:
     creditor = _child(tx, "Cdtr")
     recipient_name = _text(creditor, "Nm")
     recipient_street, recipient_city = _postal_address(creditor)
@@ -159,6 +179,14 @@ def _transaction_to_upn(
     )
     if not recipient_iban:
         raise PainParseError("credit transfer transaction has no creditor IBAN")
+
+    amount_cents, currency = _instructed_amount(tx)
+    if currency and currency != EUR:
+        log.warning(
+            "skipping pain transaction to %s: unsupported currency %s (EPC is EUR-only)",
+            recipient_iban, currency,
+        )
+        return None
 
     reference, purpose = _remittance(tx)
     purpose_code = _text(tx, "Purp", "Cd") or "OTHR"
@@ -172,7 +200,7 @@ def _transaction_to_upn(
         payer_name=payer_name[:33],
         payer_street=payer_street[:33],
         payer_city=payer_city[:33],
-        amount_cents=_parse_amount_cents(_text(tx, "Amt", "InstdAmt")),
+        amount_cents=amount_cents,
         payment_date=None,
         urgent=False,
         purpose_code=purpose_code,
@@ -231,18 +259,18 @@ def parse_pain_credit_transfers(
             )
 
         for tx in _children(payment_info, "CdtTrfTxInf"):
-            results.append(
-                _transaction_to_upn(
-                    tx,
-                    payer_name=payer_name,
-                    payer_street=payer_street,
-                    payer_city=payer_city,
-                    payer_iban=payer_iban,
-                    execution_date=execution_date,
-                )
+            upn = _transaction_to_upn(
+                tx,
+                payer_name=payer_name,
+                payer_street=payer_street,
+                payer_city=payer_city,
+                payer_iban=payer_iban,
+                execution_date=execution_date,
             )
+            if upn is not None:
+                results.append(upn)
 
     if not results:
-        raise PainParseError("pain.001 message contains no credit transfers")
+        raise PainParseError("pain.001 message contains no usable EUR credit transfers")
 
     return results

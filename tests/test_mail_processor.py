@@ -4,19 +4,20 @@ from email.mime.multipart import MIMEMultipart
 from unittest import mock
 
 from core.upn import UPN
-from scripts.mail_processor import (
+from scripts.mail_processor import SmtpConfig, _send_mail
+from core.payments import (
     PaymentItem,
-    SmtpConfig,
     _build_payment_text_block,
     _derive_verified_gmail_sender,
     _merge_payments_with_precedence,
-    _send_mail,
     plan_payment_batches,
+    scan_message_for_payments,
 )
 from parsers.xmldsig import CertificateInfo, SignatureResult, SignerInfo
+from tests.test_pain import PAIN_TWO_TX
 
 
-def _upn(*, iban: str, reference: str, name: str) -> UPN:
+def _upn(*, iban: str, reference: str, name: str, amount_cents: int = 100) -> UPN:
     return UPN(
         payer_iban="",
         deposit=False,
@@ -25,7 +26,7 @@ def _upn(*, iban: str, reference: str, name: str) -> UPN:
         payer_name="",
         payer_street="",
         payer_city="",
-        amount_cents=100,
+        amount_cents=amount_cents,
         payment_date=None,
         urgent=False,
         purpose_code="OTHR",
@@ -44,8 +45,8 @@ class TestPaymentPrecedence(unittest.TestCase):
         iban = "SI56020100012345678"
         reference = "SI00123"
 
-        with mock.patch("scripts.mail_processor.generate_upn_slip_png", return_value=b"slip"), mock.patch(
-            "scripts.mail_processor.generate_epc_qr_labeled", return_value=b"epc"
+        with mock.patch("core.payments.generate_upn_slip_png", return_value=b"slip"), mock.patch(
+            "core.payments.generate_epc_qr_labeled", return_value=b"epc"
         ):
             payments = _merge_payments_with_precedence(
                 text_upns=[(_upn(iban=iban, reference=reference, name="Text"), "email-body")],
@@ -62,9 +63,9 @@ class TestPaymentPrecedence(unittest.TestCase):
         reference = "SI00123"
 
         with mock.patch(
-            "scripts.mail_processor.generate_upn_slip_png",
+            "core.payments.generate_upn_slip_png",
             return_value=b"slip",
-        ), mock.patch("scripts.mail_processor.generate_epc_qr_labeled", return_value=b"epc"):
+        ), mock.patch("core.payments.generate_epc_qr_labeled", return_value=b"epc"):
             payments = _merge_payments_with_precedence(
                 text_upns=[(_upn(iban=iban, reference=reference, name="Text"), "email-body")],
                 eslog_upns=[],
@@ -83,9 +84,9 @@ class TestPaymentPrecedence(unittest.TestCase):
         reference = "SI00123"
 
         with mock.patch(
-            "scripts.mail_processor.generate_upn_slip_png",
+            "core.payments.generate_upn_slip_png",
             return_value=b"slip",
-        ), mock.patch("scripts.mail_processor.generate_epc_qr_labeled", return_value=b"epc"):
+        ), mock.patch("core.payments.generate_epc_qr_labeled", return_value=b"epc"):
             payments = _merge_payments_with_precedence(
                 text_upns=[],
                 eslog_upns=[
@@ -152,8 +153,8 @@ class TestPaymentPrecedence(unittest.TestCase):
             upn=_upn(iban=iban, reference=reference, name="QR"),
         )
 
-        with mock.patch("scripts.mail_processor.generate_upn_slip_png", return_value=b"slip"), mock.patch(
-            "scripts.mail_processor.generate_epc_qr_labeled", return_value=b"epc"
+        with mock.patch("core.payments.generate_upn_slip_png", return_value=b"slip"), mock.patch(
+            "core.payments.generate_epc_qr_labeled", return_value=b"epc"
         ):
             pain_only = _merge_payments_with_precedence(
                 text_upns=[],
@@ -175,8 +176,8 @@ class TestPaymentPrecedence(unittest.TestCase):
         self.assertEqual(with_qr[0].upn.recipient_name, "QR")
 
     def test_distinct_pain_transactions_are_all_kept(self) -> None:
-        with mock.patch("scripts.mail_processor.generate_upn_slip_png", return_value=b"slip"), mock.patch(
-            "scripts.mail_processor.generate_epc_qr_labeled", return_value=b"epc"
+        with mock.patch("core.payments.generate_upn_slip_png", return_value=b"slip"), mock.patch(
+            "core.payments.generate_epc_qr_labeled", return_value=b"epc"
         ):
             payments = _merge_payments_with_precedence(
                 text_upns=[],
@@ -190,6 +191,48 @@ class TestPaymentPrecedence(unittest.TestCase):
 
         self.assertEqual(len(payments), 2)
 
+    def test_same_creditor_blank_ref_different_amounts_both_kept(self) -> None:
+        # Common pain.001 case: two invoices to the same creditor, no structured
+        # reference, different amounts. Both must survive (amount is in the key).
+        iban = "SI56011006030694121"
+        with mock.patch("core.payments.generate_upn_slip_png", return_value=b"slip"), mock.patch(
+            "core.payments.generate_epc_qr_labeled", return_value=b"epc"
+        ):
+            payments = _merge_payments_with_precedence(
+                text_upns=[],
+                eslog_upns=[],
+                qr_payments=[],
+                pain_upns=[
+                    (_upn(iban=iban, reference="", name="A", amount_cents=1000), "b.xml (pain.001 #1)"),
+                    (_upn(iban=iban, reference="", name="B", amount_cents=2500), "b.xml (pain.001 #2)"),
+                ],
+            )
+
+        self.assertEqual(len(payments), 2)
+        self.assertEqual({p.upn.amount_cents for p in payments}, {1000, 2500})
+
+    def test_same_payment_across_channels_still_merges(self) -> None:
+        # Same (iban, ref, amount) found via eSLOG and QR collapses to one.
+        iban = "SI56020100012345678"
+        ref = "SI00123"
+        qr_item = PaymentItem(
+            sources=["invoice.pdf#page=1"],
+            kind="upn",
+            note="UPN QR (converted to EPC SCT)",
+            upn=_upn(iban=iban, reference=ref, name="QR", amount_cents=4200),
+        )
+        with mock.patch("core.payments.generate_upn_slip_png", return_value=b"slip"), mock.patch(
+            "core.payments.generate_epc_qr_labeled", return_value=b"epc"
+        ):
+            payments = _merge_payments_with_precedence(
+                text_upns=[],
+                eslog_upns=[(_upn(iban=iban, reference=ref, name="eSLOG", amount_cents=4200), "x.xml", None)],
+                qr_payments=[qr_item],
+            )
+
+        self.assertEqual(len(payments), 1)
+        self.assertEqual(payments[0].upn.recipient_name, "QR")
+
 
 def _payment_with_png(size: int) -> PaymentItem:
     return PaymentItem(
@@ -198,6 +241,55 @@ def _payment_with_png(size: int) -> PaymentItem:
         note="pain.001",
         epc_qr_png=b"x" * size,
     )
+
+
+class TestPainThroughMail(unittest.TestCase):
+    def _message_with_pain(self, xml: str) -> email.message.Message:
+        from email.mime.application import MIMEApplication
+        from email.mime.text import MIMEText
+
+        msg = MIMEMultipart("mixed")
+        msg["From"] = "billing@trusted.com"
+        msg["Subject"] = "Batch"
+        msg.attach(MIMEText("see attached", "plain", "utf-8"))
+        part = MIMEApplication(xml.encode(), _subtype="xml")
+        part.add_header("Content-Disposition", "attachment", filename="batch.xml")
+        msg.attach(part)
+        return msg
+
+    def test_pain_attachment_yields_one_payment_per_transaction(self) -> None:
+        with mock.patch("core.payments.generate_upn_slip_png", return_value=b"slip"), mock.patch(
+            "core.payments.generate_epc_qr_labeled", return_value=b"epc"
+        ):
+            payments, warnings = scan_message_for_payments(
+                self._message_with_pain(PAIN_TWO_TX), max_runtime_s=0,
+            )
+
+        self.assertEqual(len(payments), 2)
+        ibans = {p.upn.recipient_iban for p in payments}
+        self.assertEqual(ibans, {"SI56011006030694121", "SI52031001000051063"})
+        self.assertTrue(all(p.epc_qr_png is not None for p in payments))
+        self.assertEqual(warnings, [])
+
+    def test_pain_same_creditor_blank_ref_not_collapsed(self) -> None:
+        # Two transactions: same creditor IBAN, no structured reference, different
+        # amounts. The full scan+merge pipeline must keep both.
+        xml = PAIN_TWO_TX.replace(
+            "<CdtrAcct><Id><IBAN>SI52031001000051063</IBAN></Id></CdtrAcct>",
+            "<CdtrAcct><Id><IBAN>SI56011006030694121</IBAN></Id></CdtrAcct>",
+        ).replace(
+            "<Strd><CdtrRefInf><Ref>SI00123456</Ref></CdtrRefInf></Strd>",
+            "<Ustrd>Invoice A</Ustrd>",
+        )
+        with mock.patch("core.payments.generate_upn_slip_png", return_value=b"slip"), mock.patch(
+            "core.payments.generate_epc_qr_labeled", return_value=b"epc"
+        ):
+            payments, _ = scan_message_for_payments(
+                self._message_with_pain(xml), max_runtime_s=0,
+            )
+
+        self.assertEqual(len(payments), 2)
+        self.assertEqual({p.upn.amount_cents for p in payments}, {12345, 1000})
 
 
 class TestPaymentBatching(unittest.TestCase):
@@ -325,8 +417,8 @@ class TestMailFormatting(unittest.TestCase):
             ),
         )
 
-        with mock.patch("scripts.mail_processor.generate_upn_slip_png", return_value=b"slip"), mock.patch(
-            "scripts.mail_processor.generate_epc_qr_labeled", return_value=b"epc"
+        with mock.patch("core.payments.generate_upn_slip_png", return_value=b"slip"), mock.patch(
+            "core.payments.generate_epc_qr_labeled", return_value=b"epc"
         ):
             lines = _build_payment_text_block(payment)
 

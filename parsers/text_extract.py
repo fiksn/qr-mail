@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Extract IBAN + SI/RF reference pairs from plain text, PDFs, and images.
 
 Scans text for Slovenian IBANs (validated via MOD97) and nearby SI/RF
@@ -11,6 +9,8 @@ Text sources:
   - PDF embedded text (via poppler's pdftotext)
   - Image OCR (via pytesseract, optional)
 """
+from __future__ import annotations
+
 import io
 import logging
 import os

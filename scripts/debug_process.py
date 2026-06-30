@@ -37,12 +37,8 @@ os.environ.setdefault("ALLOWED_SENDERS", "*")
 if __package__ in {None, ""}:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from scripts.mail_processor import (
-    build_forward,
-    dedupe_qr_results,
-    find_payments,
-    scan_attachments,
-)
+from core.payments import dedupe_qr_results, find_payments, scan_attachments
+from scripts.mail_processor import build_forward
 
 
 def build_fake_email(files: list[str], sender: str, subject: str) -> email.message.Message:

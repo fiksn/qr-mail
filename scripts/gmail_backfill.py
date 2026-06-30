@@ -45,7 +45,7 @@ from scripts.gmail_client import (
     load_gmail_config,
 )
 from scripts.gmail_reply import gmail_from_clause, process_message
-from scripts.mail_processor import (
+from core.payments import (
     DEFAULT_MAX_ATTACHMENT_BYTES,
     DEFAULT_MAX_EMAIL_BYTES,
     DEFAULT_MAX_MESSAGE_RUNTIME_S,
@@ -123,8 +123,17 @@ def build_client(mailbox: str, service_account_file: str) -> GmailClient:
 
 
 def build_query(senders: list[str], since: datetime) -> str:
-    from_clause = gmail_from_clause(senders) or "(" + " OR ".join(f"from:{s}" for s in senders) + ")"
-    return f"{from_clause} after:{int(since.timestamp())}"
+    # If the sender patterns can't be expressed as Gmail from: terms, scope by
+    # time only and let per-message verification filter the rest, rather than
+    # emitting bogus glob terms that match unpredictably.
+    from_clause = gmail_from_clause(senders)
+    if not from_clause:
+        log.warning(
+            "Sender patterns are not expressible as a Gmail query; "
+            "scanning the whole window (verification still applies)"
+        )
+    after = f"after:{int(since.timestamp())}"
+    return f"{from_clause} {after}".strip()
 
 
 def main() -> None:

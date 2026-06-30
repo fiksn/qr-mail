@@ -98,6 +98,30 @@ def test_parse_pain_nested_execution_date() -> None:
     assert upns[0].payment_deadline == date(2026, 6, 20)
 
 
+def test_skips_non_eur_transaction() -> None:
+    # First transaction is USD → skipped; only the EUR one survives.
+    xml = PAIN_TWO_TX.replace(
+        '<InstdAmt Ccy="EUR">123.45</InstdAmt>',
+        '<InstdAmt Ccy="USD">123.45</InstdAmt>',
+    )
+    upns = parse_pain_credit_transfers(xml)
+    assert len(upns) == 1
+    assert upns[0].recipient_iban == "SI52031001000051063"
+
+
+def test_all_non_eur_raises() -> None:
+    xml = PAIN_TWO_TX.replace('Ccy="EUR"', 'Ccy="GBP"')
+    with pytest.raises(PainParseError, match="no usable EUR credit transfers"):
+        parse_pain_credit_transfers(xml)
+
+
+def test_missing_ccy_is_assumed_eur() -> None:
+    xml = PAIN_TWO_TX.replace('<InstdAmt Ccy="EUR">123.45</InstdAmt>', "<InstdAmt>123.45</InstdAmt>")
+    upns = parse_pain_credit_transfers(xml)
+    assert len(upns) == 2
+    assert upns[0].amount_cents == 12345
+
+
 def test_rejects_non_pain_xml() -> None:
     with pytest.raises(PainParseError, match="root element"):
         parse_pain_credit_transfers(
@@ -112,7 +136,7 @@ def test_rejects_pain_without_transactions() -> None:
     <GrpHdr><MsgId>X</MsgId></GrpHdr>
   </CstmrCdtTrfInitn>
 </Document>"""
-    with pytest.raises(PainParseError, match="no credit transfers"):
+    with pytest.raises(PainParseError, match="no usable EUR credit transfers"):
         parse_pain_credit_transfers(xml)
 
 

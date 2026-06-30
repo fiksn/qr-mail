@@ -1,0 +1,19 @@
+# Mirrors .gitignore, plus build-only excludes. The broad media globs keep
+# repo sample documents out of the build context without enumerating them.
+.DS_Store
+*.png
+*.pdf
+*.xml
+__pycache__/
+.pytest_cache
+.venv/
+
+# Version control and dev/build files not needed in the image.
+.git
+.github
+tests
+flake.nix
+flake.lock
+module.nix
+Dockerfile
+.dockerignore

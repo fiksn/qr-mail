@@ -38,7 +38,7 @@ if __package__ in {None, ""}:
 
 from core.routing import matches
 from scripts.gmail_client import GmailClient
-from scripts.mail_processor import (
+from core.payments import (
     DEFAULT_MAX_ATTACHMENT_BYTES,
     DEFAULT_MAX_EMAIL_BYTES,
     DEFAULT_MAX_MESSAGE_RUNTIME_S,

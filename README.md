@@ -104,7 +104,8 @@ Legacy OCR slip mode uses `./upn_base_legacy_ocr.jpg` by default and requires an
 
 Project layout:
 
-- `core/` payment models, routing, and EPC/UPN conversion helpers
+- `core/` payment models, routing, EPC/UPN conversion, and the shared
+  scan/merge/render engine (`core/payments.py`) used by every entry point
 - `parsers/` eSLOG, ISO 20022 pain.001, ICL envelope, and text extraction logic
 - `scripts/` runnable CLIs and mail-processing entry points
 - `tests/` test suite

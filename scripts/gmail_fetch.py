@@ -38,7 +38,7 @@ if __package__ in {None, ""}:
 from core.routing import parse_allowed_senders
 from scripts.gmail_client import GmailClient, GmailConfigError, load_gmail_config
 from scripts.gmail_reply import gmail_from_clause, process_message
-from scripts.mail_processor import (
+from core.payments import (
     DEFAULT_MAX_ATTACHMENT_BYTES,
     DEFAULT_MAX_EMAIL_BYTES,
     DEFAULT_MAX_MESSAGE_RUNTIME_S,
@@ -151,7 +151,13 @@ def main() -> None:
 
     while True:
         try:
-            for msg_id, thread_id in client.search(query, max_results=MAX_PER_POLL):
+            batch = client.search(query, max_results=MAX_PER_POLL)
+            # Drop stale failure counters for messages no longer in the working
+            # set (e.g. read or deleted elsewhere) so the dict can't grow without
+            # bound over long uptimes.
+            batch_ids = {msg_id for msg_id, _ in batch}
+            attempts = {k: v for k, v in attempts.items() if k in batch_ids}
+            for msg_id, thread_id in batch:
                 try:
                     raw = client.get_raw_message(msg_id)
                     status = process_message(

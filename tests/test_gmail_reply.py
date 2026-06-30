@@ -9,7 +9,7 @@ from scripts.gmail_reply import (
     gmail_from_clause,
     process_message,
 )
-from scripts.mail_processor import PaymentItem
+from core.payments import PaymentItem
 
 
 def _payment(name: str, *, png: bytes = b"x" * 100) -> PaymentItem:
