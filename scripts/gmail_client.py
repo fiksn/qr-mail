@@ -43,6 +43,11 @@ from typing import Any, Optional
 # Least privilege: gmail.modify covers read, label and insert — everything the
 # pipeline needs — without granting permanent-delete (which mail.google.com would).
 SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
+# Read-only Directory API scope, used only when expanding a DWD_USERS_GLOB into a
+# concrete set of mailboxes. Must be authorised for the service account in the
+# Workspace Admin console alongside SCOPES, and the impersonated subject must be
+# a user with directory-read rights (an admin).
+DIRECTORY_SCOPE = "https://www.googleapis.com/auth/admin.directory.user.readonly"
 _TOKEN_FILE_MODE = 0o600
 
 log = logging.getLogger(__name__)
@@ -135,6 +140,53 @@ def _service_account_credentials(cfg: GmailConfig, subject: str) -> Any:
         cfg.service_account_file, scopes=SCOPES
     )
     return creds.with_subject(subject)
+
+
+def list_directory_users(cfg: GmailConfig, admin_subject: str) -> list[str]:
+    """Return the primary email of every active Workspace user in the domain.
+
+    Requires service_account (domain-wide delegation) mode. ``admin_subject`` is
+    impersonated to query the Admin SDK Directory API, so it must be a user with
+    directory-read rights and the ``DIRECTORY_SCOPE`` must be authorised for the
+    service account. Suspended users are skipped.
+    """
+    if cfg.auth_mode != "service_account":
+        raise GmailConfigError(
+            "listing directory users requires service_account (domain-wide delegation) mode"
+        )
+    if not cfg.service_account_file or not Path(cfg.service_account_file).exists():
+        raise FileNotFoundError(
+            f"service account key not found at {cfg.service_account_file!r}"
+        )
+
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+
+    creds = service_account.Credentials.from_service_account_file(
+        cfg.service_account_file, scopes=[DIRECTORY_SCOPE]
+    ).with_subject(admin_subject)
+    service = build("admin", "directory_v1", credentials=creds, cache_discovery=False)
+
+    users: list[str] = []
+    page_token = ""
+    while True:
+        kwargs: dict[str, Any] = {
+            "customer": "my_customer",
+            "maxResults": 500,
+            "projection": "basic",
+            "orderBy": "email",
+        }
+        if page_token:
+            kwargs["pageToken"] = page_token
+        resp = service.users().list(**kwargs).execute()
+        for user in resp.get("users", []):
+            email = user.get("primaryEmail")
+            if email and not user.get("suspended", False):
+                users.append(email)
+        page_token = resp.get("nextPageToken", "")
+        if not page_token:
+            break
+    return users
 
 
 def _oauth_credentials(cfg: GmailConfig) -> Any:

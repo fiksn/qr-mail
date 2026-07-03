@@ -1,7 +1,8 @@
 import unittest
 from unittest import mock
 
-from scripts.gmail_fetch import gmail_from_clause, record_failure
+from scripts.gmail_client import GmailConfig, GmailConfigError
+from scripts.gmail_fetch import gmail_from_clause, record_failure, resolve_mailboxes
 
 
 class TestRecordFailure(unittest.TestCase):
@@ -56,6 +57,47 @@ class TestRecordFailure(unittest.TestCase):
 class TestFromClauseReexport(unittest.TestCase):
     def test_reexported_helper_works(self) -> None:
         self.assertEqual(gmail_from_clause(["*@trusted.com"]), "(from:trusted.com)")
+
+
+class TestResolveMailboxes(unittest.TestCase):
+    def _cfg(self, mode: str) -> GmailConfig:
+        return GmailConfig(auth_mode=mode, user="admin@corp.com")
+
+    def test_no_glob_returns_single_user(self) -> None:
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(
+                resolve_mailboxes(self._cfg("service_account")), ["admin@corp.com"]
+            )
+
+    def test_blank_glob_returns_single_user(self) -> None:
+        with mock.patch.dict("os.environ", {"DWD_USERS_GLOB": " : "}, clear=True):
+            self.assertEqual(
+                resolve_mailboxes(self._cfg("oauth")), ["admin@corp.com"]
+            )
+
+    def test_glob_requires_service_account(self) -> None:
+        with mock.patch.dict("os.environ", {"DWD_USERS_GLOB": "*@corp.com"}, clear=True):
+            with self.assertRaises(GmailConfigError):
+                resolve_mailboxes(self._cfg("oauth"))
+
+    def test_glob_filters_directory_users(self) -> None:
+        users = ["a@corp.com", "b@corp.com", "c@other.com"]
+        env = {"DWD_USERS_GLOB": "*@corp.com"}
+        with mock.patch.dict("os.environ", env, clear=True), mock.patch(
+            "scripts.gmail_fetch.list_directory_users", return_value=users
+        ):
+            self.assertEqual(
+                resolve_mailboxes(self._cfg("service_account")),
+                ["a@corp.com", "b@corp.com"],
+            )
+
+    def test_glob_matching_none_returns_empty(self) -> None:
+        with mock.patch.dict(
+            "os.environ", {"DWD_USERS_GLOB": "*@nope.com"}, clear=True
+        ), mock.patch(
+            "scripts.gmail_fetch.list_directory_users", return_value=["a@corp.com"]
+        ):
+            self.assertEqual(resolve_mailboxes(self._cfg("service_account")), [])
 
 
 if __name__ == "__main__":

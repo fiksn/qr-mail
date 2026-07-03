@@ -317,9 +317,31 @@ def _load_font(size: int, *, bold: bool = False) -> Any:
     return ImageFont.load_default()
 
 
+# Legal-form suffixes that only mark the company type, not the name itself.
+_COMPANY_FORMS = {"doo", "dd", "sp", "dno", "kd", "kda", "gmbh", "ltd", "inc"}
+
+
+def _monogram_words(name: str) -> list[str]:
+    """Split a beneficiary name into meaningful monogram words.
+
+    Legal-form suffixes (d.o.o., d.d., s.p., …) are dropped, and separators
+    ('-', ' ') are stripped, so 'T - 2 d.o.o.' yields ['T', '2'] rather than
+    ['T', '-', '2', 'd.o.o.'].
+    """
+    words = []
+    for token in name.strip().split():
+        token = token.replace("-", "")
+        if not token:
+            continue
+        if token.replace(".", "").lower() in _COMPANY_FORMS:
+            continue
+        words.append(token)
+    return words
+
+
 def _epc_monogram(name: str) -> str:
     """Derive a 1–2 character monogram from a beneficiary name (e.g. 'SK')."""
-    words = [w for w in name.strip().split() if w]
+    words = _monogram_words(name)
     if not words:
         return ""
     if len(words) == 1:

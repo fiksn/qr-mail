@@ -72,6 +72,7 @@ let
   gmailFetcherBin = pkgs.writeShellScriptBin "qr-mail-gmail-fetch" ''
     ${scanEnv}
     export GMAIL_IMPERSONATE_ADDRESS=${lib.escapeShellArg cfg.gmailImpersonateAddress}
+    export DWD_USERS_GLOB=${lib.escapeShellArg (lib.concatStringsSep ":" cfg.dwdUsersGlob)}
     export GMAIL_POLL_INTERVAL_S=${toString cfg.gmailPollIntervalSeconds}
     export GMAIL_PROCESSED_LABEL=${lib.escapeShellArg cfg.gmailProcessedLabel}
     export GMAIL_FAILED_LABEL=${lib.escapeShellArg cfg.gmailFailedLabel}
@@ -331,6 +332,28 @@ in
         Mailbox the Gmail daemon reads and inserts replies into. In
         domain-wide-delegation mode it is the address impersonated by the
         service account; in OAuth mode it is the user that granted consent.
+      '';
+    };
+
+    dwdUsersGlob = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [ "*@corp.example.com" "billing@*" ];
+      description = ''
+        Optional colon-separated glob patterns selecting which Workspace
+        mailboxes the Gmail daemon polls. Only meaningful in domain-wide
+        delegation mode (<option>gmailServiceAccountFile</option> set).
+
+        When empty, the daemon polls only
+        <option>gmailImpersonateAddress</option>. When set, it lists every
+        Workspace user once at startup (via the Admin SDK Directory API,
+        impersonating <option>gmailImpersonateAddress</option>), keeps those
+        matching any glob — possibly none — and polls each matched mailbox.
+
+        Requires the <literal>admin.directory.user.readonly</literal> scope to
+        be authorised for the service account in the Workspace Admin console,
+        and <option>gmailImpersonateAddress</option> to be a user with
+        directory-read rights.
       '';
     };
 

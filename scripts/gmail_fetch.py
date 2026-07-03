@@ -14,7 +14,13 @@ Configuration via environment variables:
   MY_ADDRESS                  From: address of the inserted replies (required)
   ALLOWED_SENDERS             colon-separated sender globs, e.g. "*@trusted.com"
   TRUSTED_SENDERS             additional sender globs (same effect here)
-  GMAIL_IMPERSONATE_ADDRESS   mailbox to read and insert into (required)
+  GMAIL_IMPERSONATE_ADDRESS   mailbox to read and insert into (required); in
+                              DWD mode also the admin subject used to list users
+  DWD_USERS_GLOB              optional colon-separated globs, e.g. "*@corp.com".
+                              When set (service-account/DWD mode only), the
+                              daemon lists all Workspace users once at startup,
+                              keeps those matching any glob, and polls every
+                              matched mailbox. Unset → only GMAIL_IMPERSONATE_ADDRESS.
   GMAIL_SERVICE_ACCOUNT_FILE / GMAIL_OAUTH_TOKEN_FILE / GMAIL_OAUTH_CLIENT_SECRET_FILE
   GMAIL_POLL_INTERVAL_S       seconds between polls (default: 60)
   GMAIL_PROCESSED_LABEL       label applied after handling (default: qr-mail-processed)
@@ -31,12 +37,19 @@ import logging
 import os
 import sys
 import time
+from dataclasses import dataclass, field
 
 if __package__ in {None, ""}:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.routing import parse_allowed_senders
-from scripts.gmail_client import GmailClient, GmailConfigError, load_gmail_config
+from core.routing import is_allowed_sender, parse_allowed_senders
+from scripts.gmail_client import (
+    GmailClient,
+    GmailConfig,
+    GmailConfigError,
+    list_directory_users,
+    load_gmail_config,
+)
 from scripts.gmail_reply import gmail_from_clause, process_message
 from core.payments import (
     DEFAULT_MAX_ATTACHMENT_BYTES,
@@ -88,6 +101,106 @@ def _load_senders() -> list[str]:
     return parse_allowed_senders(allowed + trusted)
 
 
+def resolve_mailboxes(cfg: GmailConfig) -> list[str]:
+    """Return the mailboxes to poll, expanding DWD_USERS_GLOB if configured.
+
+    Without DWD_USERS_GLOB the daemon polls only ``cfg.user``. With it (DWD mode
+    only), all directory users are listed once and those matching any glob are
+    returned — possibly none, which is not an error.
+    """
+    globs = parse_allowed_senders(os.environ.get("DWD_USERS_GLOB", "").split(":"))
+    if not globs:
+        return [cfg.user]
+    if cfg.auth_mode != "service_account":
+        raise GmailConfigError(
+            "DWD_USERS_GLOB requires service_account (domain-wide delegation) mode"
+        )
+    all_users = list_directory_users(cfg, cfg.user)
+    matched = [u for u in all_users if is_allowed_sender(u, globs)]
+    log.info(
+        "DWD_USERS_GLOB %s matched %d of %d directory users",
+        globs, len(matched), len(all_users),
+    )
+    if not matched:
+        log.warning("DWD_USERS_GLOB matched no users; nothing to poll")
+    return matched
+
+
+@dataclass
+class Mailbox:
+    """Per-mailbox polling state (one Gmail client and its retry counters)."""
+
+    client: GmailClient
+    label_id: str
+    failed_label_id: str
+    attempts: dict[str, int] = field(default_factory=dict)
+
+
+def build_mailbox(
+    cfg: GmailConfig, subject: str, processed_label: str, failed_label: str
+) -> Mailbox:
+    """Build a Mailbox for ``subject``, creating its processed/failed labels."""
+    client = GmailClient(cfg, subject=subject)
+    return Mailbox(
+        client=client,
+        label_id=client.get_or_create_label(processed_label),
+        failed_label_id=client.get_or_create_label(failed_label),
+    )
+
+
+@dataclass(frozen=True)
+class PollSettings:
+    """Immutable per-poll configuration shared across all mailboxes."""
+
+    my_address: str
+    senders: list[str]
+    query: str
+    failed_label: str
+    max_attempts: int
+    max_email_bytes: int
+    max_attachment_bytes: int
+    max_runtime_s: int
+
+
+def poll_mailbox(mailbox: Mailbox, settings: PollSettings) -> None:
+    """Run one poll cycle for a single mailbox, inserting replies as needed."""
+    client = mailbox.client
+    batch = client.search(settings.query, max_results=MAX_PER_POLL)
+    # Drop stale failure counters for messages no longer in the working set
+    # (e.g. read or deleted elsewhere) so the dict can't grow without bound.
+    batch_ids = {msg_id for msg_id, _ in batch}
+    mailbox.attempts = {k: v for k, v in mailbox.attempts.items() if k in batch_ids}
+    for msg_id, thread_id in batch:
+        try:
+            raw = client.get_raw_message(msg_id)
+            status = process_message(
+                client,
+                raw,
+                my_address=settings.my_address,
+                allowed_patterns=settings.senders,
+                thread_id=thread_id,
+                strict_sender=True,
+                max_email_bytes=settings.max_email_bytes,
+                max_attachment_bytes=settings.max_attachment_bytes,
+                max_runtime_s=settings.max_runtime_s,
+            )
+            if status == "skipped-sender":
+                # Could not verify the sender — flag handled but leave unread.
+                client.add_label(msg_id, mailbox.label_id)
+            else:
+                client.mark_processed(msg_id, mailbox.label_id)
+            mailbox.attempts.pop(msg_id, None)
+            log.info("[%s] message %s: %s", client.user_id, msg_id, status)
+        except Exception as exc:  # noqa: BLE001
+            record_failure(
+                client, msg_id, mailbox.attempts,
+                failed_label_id=mailbox.failed_label_id,
+                failed_label=settings.failed_label,
+                max_attempts=settings.max_attempts,
+                exc=exc,
+            )
+
+
 def main() -> None:
     logging.basicConfig(
         stream=sys.stderr,
@@ -126,14 +239,20 @@ def main() -> None:
     max_attachment_bytes = int(os.environ.get("MAX_ATTACHMENT_BYTES", DEFAULT_MAX_ATTACHMENT_BYTES))
     max_runtime_s = int(os.environ.get("MAX_MESSAGE_RUNTIME_S", DEFAULT_MAX_MESSAGE_RUNTIME_S))
 
+    try:
+        mailbox_addrs = resolve_mailboxes(cfg)
+    except GmailConfigError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+
     log.info(
-        "Starting (mode=%s, mailbox=%s, poll=%ds, label=%r)",
-        cfg.auth_mode, cfg.user, poll_interval, processed_label,
+        "Starting (mode=%s, mailboxes=%d, poll=%ds, label=%r)",
+        cfg.auth_mode, len(mailbox_addrs), poll_interval, processed_label,
     )
 
-    client = GmailClient(cfg)
-    label_id = client.get_or_create_label(processed_label)
-    failed_label_id = client.get_or_create_label(failed_label)
+    mailboxes = [
+        build_mailbox(cfg, addr, processed_label, failed_label) for addr in mailbox_addrs
+    ]
 
     from_clause = gmail_from_clause(senders)
     if not from_clause:
@@ -145,50 +264,23 @@ def main() -> None:
     query = f"is:unread -label:{processed_label} -label:{failed_label} {from_clause}".strip()
     log.info("Gmail query: %s", query)
 
-    # Per-message failure counts (in-memory). A message that keeps throwing is
-    # labelled failed after max_attempts so it stops being re-fetched forever.
-    attempts: dict[str, int] = {}
+    settings = PollSettings(
+        my_address=my_address,
+        senders=senders,
+        query=query,
+        failed_label=failed_label,
+        max_attempts=max_attempts,
+        max_email_bytes=max_email_bytes,
+        max_attachment_bytes=max_attachment_bytes,
+        max_runtime_s=max_runtime_s,
+    )
 
     while True:
-        try:
-            batch = client.search(query, max_results=MAX_PER_POLL)
-            # Drop stale failure counters for messages no longer in the working
-            # set (e.g. read or deleted elsewhere) so the dict can't grow without
-            # bound over long uptimes.
-            batch_ids = {msg_id for msg_id, _ in batch}
-            attempts = {k: v for k, v in attempts.items() if k in batch_ids}
-            for msg_id, thread_id in batch:
-                try:
-                    raw = client.get_raw_message(msg_id)
-                    status = process_message(
-                        client,
-                        raw,
-                        my_address=my_address,
-                        allowed_patterns=senders,
-                        thread_id=thread_id,
-                        strict_sender=True,
-                        max_email_bytes=max_email_bytes,
-                        max_attachment_bytes=max_attachment_bytes,
-                        max_runtime_s=max_runtime_s,
-                    )
-                    if status == "skipped-sender":
-                        # Could not verify the sender — flag handled but leave unread.
-                        client.add_label(msg_id, label_id)
-                    else:
-                        client.mark_processed(msg_id, label_id)
-                    attempts.pop(msg_id, None)
-                    log.info("message %s: %s", msg_id, status)
-                except Exception as exc:  # noqa: BLE001
-                    record_failure(
-                        client, msg_id, attempts,
-                        failed_label_id=failed_label_id,
-                        failed_label=failed_label,
-                        max_attempts=max_attempts,
-                        exc=exc,
-                    )
-        except Exception as exc:  # noqa: BLE001
-            log.error("Error during poll: %s", exc)
-
+        for mailbox in mailboxes:
+            try:
+                poll_mailbox(mailbox, settings)
+            except Exception as exc:  # noqa: BLE001
+                log.error("[%s] error during poll: %s", mailbox.client.user_id, exc)
         time.sleep(poll_interval)
 
 

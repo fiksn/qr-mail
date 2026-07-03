@@ -158,7 +158,8 @@ Two modes are supported and auto-detected from configuration:
   `GMAIL_OAUTH_TOKEN_FILE` is set (and `GMAIL_SERVICE_ACCOUNT_FILE` is not).
 - **Service account + domain-wide delegation (DWD)** — a service account
   impersonates a mailbox in the workspace. Selected when
-  `GMAIL_SERVICE_ACCOUNT_FILE` is set.
+  `GMAIL_SERVICE_ACCOUNT_FILE` is set. Optionally polls *many* mailboxes at once
+  via `DWD_USERS_GLOB` (see below).
 
 A single least-privilege OAuth scope, `gmail.modify`
 (`https://www.googleapis.com/auth/gmail.modify`), covers reading, labelling and
@@ -168,7 +169,8 @@ Relevant environment variables (the NixOS module sets these for you):
 
 | variable | purpose |
 |----------|---------|
-| `GMAIL_IMPERSONATE_ADDRESS` | mailbox to read and insert replies into (required) |
+| `GMAIL_IMPERSONATE_ADDRESS` | mailbox to read and insert replies into (required); in DWD mode also the admin subject used to list users |
+| `DWD_USERS_GLOB` | optional colon-separated globs, e.g. `*@corp.com`. DWD only: poll every matching Workspace mailbox instead of just one |
 | `GMAIL_SERVICE_ACCOUNT_FILE` | service-account JSON → DWD mode |
 | `GMAIL_OAUTH_CLIENT_SECRET_FILE` | OAuth client secret → used for the one-time consent flow |
 | `GMAIL_OAUTH_TOKEN_FILE` | cached, refreshable OAuth token → runtime credential for OAuth mode |
@@ -210,6 +212,26 @@ single-user mode.
 3. Point `GMAIL_IMPERSONATE_ADDRESS` at the mailbox to act on (e.g.
    `qr@yourdomain.com`). It only needs to exist and receive mail.
 
+#### Polling many mailboxes (`DWD_USERS_GLOB`)
+
+By default DWD polls the single `GMAIL_IMPERSONATE_ADDRESS` mailbox. To fan out
+across many Workspace users, set `DWD_USERS_GLOB` to colon-separated globs
+(matched case-insensitively against each user's primary email):
+
+```bash
+DWD_USERS_GLOB="*@corp.com:billing@*" python3 scripts/gmail_fetch.py
+```
+
+The daemon lists every Workspace user once at startup, keeps those matching any
+glob (possibly none), and polls each. This adds two requirements:
+
+- Authorise a second scope for the service account in the Admin console
+  (step 2 above): `https://www.googleapis.com/auth/admin.directory.user.readonly`.
+- `GMAIL_IMPERSONATE_ADDRESS` must be a user with directory-read rights (an
+  admin), since it is impersonated to list the directory.
+
+Adding or removing Workspace users takes effect on the next daemon restart.
+
 ### Running
 
 - **Live daemon** (periodic fetch + reply):
@@ -242,6 +264,8 @@ services.qrMail = {
 
   # DWD:
   gmailServiceAccountFile = "/run/secrets/qr-mail-service-account.json";
+  # Optional: poll many mailboxes instead of just gmailImpersonateAddress
+  # dwdUsersGlob = [ "*@corp.example.com" ];
 
   # or single-user OAuth:
   # gmailOauthClientSecretFile = "/run/secrets/qr-mail-oauth-client.json";
