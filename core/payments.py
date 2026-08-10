@@ -564,7 +564,19 @@ def _merge_payments_with_precedence(
     for payment in qr_payments:
         add(payment, rank=5)
 
-    return extras + [payment for _, payment in merged.values()]
+    # Collapse amount-unknown duplicates: a zero-amount entry means the source
+    # (typically text/OCR extraction) recovered the creditor and reference but
+    # not the amount. If another payment shares the same (IBAN, reference) with a
+    # known non-zero amount, the zero-amount entry is redundant and would emit a
+    # bogus 0.01 EUR QR — drop it in favour of the richer source.
+    known_amount_keys = {(iban, ref) for (iban, ref, amount) in merged if amount != 0}
+    deduped = [
+        payment
+        for (iban, ref, amount), (_, payment) in merged.items()
+        if amount != 0 or (iban, ref) not in known_amount_keys
+    ]
+
+    return extras + deduped
 
 
 def scan_text_for_payments(

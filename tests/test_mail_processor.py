@@ -233,6 +233,52 @@ class TestPaymentPrecedence(unittest.TestCase):
         self.assertEqual(len(payments), 1)
         self.assertEqual(payments[0].upn.recipient_name, "QR")
 
+    def test_amount_unknown_text_collapses_into_qr(self) -> None:
+        # Text/OCR recovers creditor + reference but not the amount (0), while the
+        # QR carries the real amount. The zero-amount entry must not survive as a
+        # bogus 0.01 EUR QR; only the QR payment remains.
+        iban = "SI56020100012345678"
+        ref = "SI00123"
+        qr_item = PaymentItem(
+            sources=["invoice.pdf#page=1"],
+            kind="upn",
+            note="UPN QR (converted to EPC SCT)",
+            upn=_upn(iban=iban, reference=ref, name="QR", amount_cents=4200),
+        )
+        with mock.patch("core.payments.generate_upn_slip_png", return_value=b"slip"), mock.patch(
+            "core.payments.generate_epc_qr_labeled", return_value=b"epc"
+        ):
+            payments = _merge_payments_with_precedence(
+                text_upns=[
+                    (_upn(iban=iban, reference=ref, name="Text", amount_cents=0), "email-body")
+                ],
+                eslog_upns=[],
+                qr_payments=[qr_item],
+            )
+
+        self.assertEqual(len(payments), 1)
+        self.assertEqual(payments[0].upn.recipient_name, "QR")
+        self.assertEqual(payments[0].upn.amount_cents, 4200)
+
+    def test_amount_unknown_text_kept_when_no_richer_source(self) -> None:
+        # With no matching known-amount payment, the zero-amount extraction is the
+        # only signal available and must still be emitted.
+        iban = "SI56020100012345678"
+        ref = "SI00123"
+        with mock.patch("core.payments.generate_upn_slip_png", return_value=b"slip"), mock.patch(
+            "core.payments.generate_epc_qr_labeled", return_value=b"epc"
+        ):
+            payments = _merge_payments_with_precedence(
+                text_upns=[
+                    (_upn(iban=iban, reference=ref, name="Text", amount_cents=0), "email-body")
+                ],
+                eslog_upns=[],
+                qr_payments=[],
+            )
+
+        self.assertEqual(len(payments), 1)
+        self.assertEqual(payments[0].upn.recipient_name, "Text")
+
 
 def _payment_with_png(size: int) -> PaymentItem:
     return PaymentItem(
