@@ -65,6 +65,10 @@ DEFAULT_PDFINFO_TIMEOUT_S = 3
 # module spans dozens of pixels with JPEG-softened edges. Retry on progressively
 # downscaled copies so a native-resolution miss still gets decoded.
 QR_SCALE_LADDER = (1.0, 0.5, 0.35, 0.25)
+# A QR photographed at ~45° aliases worst against the pixel grid and can slip past
+# zbar even downscaled. Retry the whole ladder on a couple of rotated copies so a
+# skewed slip still decodes; 0° stays first so upright codes cost nothing extra.
+QR_ROTATIONS = (0, 45, 22)
 _AUTH_PASS_RE = re.compile(r"(?<![\w-])([a-z]+)=pass(?:[\s;(]|$)", re.IGNORECASE)
 _AUTH_PARAM_RE = re.compile(r"([A-Za-z0-9_.-]+)=([^;\s]+)")
 
@@ -225,22 +229,38 @@ def _suppress_fd_stderr() -> Any:
         os.close(saved_fd)
 
 
+def _decode_gray_over_scales(gray: Any) -> list[Any]:
+    """Decode a grayscale image across the downscale ladder; first hit wins."""
+    from pyzbar import pyzbar
+
+    width, height = gray.size
+    for scale in QR_SCALE_LADDER:
+        target = gray if scale == 1.0 else gray.resize(
+            (max(1, int(width * scale)), max(1, int(height * scale)))
+        )
+        results = pyzbar.decode(target, symbols=[pyzbar.ZBarSymbol.QRCODE])
+        if results:
+            if scale != 1.0:
+                log.debug("QR decoded after downscaling to %.2fx", scale)
+            return results
+    return []
+
+
 def scan_image_for_qr(img: Any) -> list[str]:
     try:
         from PIL import ImageOps
-        from pyzbar import pyzbar
+        from pyzbar import pyzbar  # noqa: F401  (ensures pyzbar is importable before decoding)
 
         gray = ImageOps.grayscale(img)
-        width, height = gray.size
         with _suppress_fd_stderr():
-            for scale in QR_SCALE_LADDER:
-                target = gray if scale == 1.0 else gray.resize(
-                    (max(1, int(width * scale)), max(1, int(height * scale)))
+            for angle in QR_ROTATIONS:
+                candidate = gray if angle == 0 else gray.rotate(
+                    angle, expand=True, fillcolor=255
                 )
-                results = pyzbar.decode(target, symbols=[pyzbar.ZBarSymbol.QRCODE])
+                results = _decode_gray_over_scales(candidate)
                 if results:
-                    if scale != 1.0:
-                        log.debug("QR decoded after downscaling to %.2fx", scale)
+                    if angle != 0:
+                        log.debug("QR decoded after rotating by %d°", angle)
                     return [_decode_qr_bytes(r.data) for r in results]
         return []
     except ImportError:
