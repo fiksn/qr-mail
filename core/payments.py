@@ -61,6 +61,10 @@ DEFAULT_PDF_RENDER_TIMEOUT_S = 20
 DEFAULT_MAX_IMAGE_PIXELS = 40_000_000
 DEFAULT_MAX_MESSAGE_RUNTIME_S = 60
 DEFAULT_PDFINFO_TIMEOUT_S = 3
+# zbar reliably fails on high-resolution phone photos (e.g. 12 MP), where each QR
+# module spans dozens of pixels with JPEG-softened edges. Retry on progressively
+# downscaled copies so a native-resolution miss still gets decoded.
+QR_SCALE_LADDER = (1.0, 0.5, 0.35, 0.25)
 _AUTH_PASS_RE = re.compile(r"(?<![\w-])([a-z]+)=pass(?:[\s;(]|$)", re.IGNORECASE)
 _AUTH_PARAM_RE = re.compile(r"([A-Za-z0-9_.-]+)=([^;\s]+)")
 
@@ -223,13 +227,24 @@ def _suppress_fd_stderr() -> Any:
 
 def scan_image_for_qr(img: Any) -> list[str]:
     try:
+        from PIL import ImageOps
         from pyzbar import pyzbar
 
+        gray = ImageOps.grayscale(img)
+        width, height = gray.size
         with _suppress_fd_stderr():
-            results = pyzbar.decode(img, symbols=[pyzbar.ZBarSymbol.QRCODE])
-        return [_decode_qr_bytes(r.data) for r in results]
+            for scale in QR_SCALE_LADDER:
+                target = gray if scale == 1.0 else gray.resize(
+                    (max(1, int(width * scale)), max(1, int(height * scale)))
+                )
+                results = pyzbar.decode(target, symbols=[pyzbar.ZBarSymbol.QRCODE])
+                if results:
+                    if scale != 1.0:
+                        log.debug("QR decoded after downscaling to %.2fx", scale)
+                    return [_decode_qr_bytes(r.data) for r in results]
+        return []
     except ImportError:
-        log.info("pyzbar not installed; QR decoding disabled")
+        log.info("pyzbar/Pillow not installed; QR decoding disabled")
         return []
     except Exception as exc:
         log.warning("pyzbar decode error: %s", exc)
