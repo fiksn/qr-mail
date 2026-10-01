@@ -172,13 +172,18 @@ def ask_reference() -> str:
             print(f"  Invalid reference: {exc}")
 
 
+def _normalize_iban(raw: str) -> str:
+    """Strip spaces, hyphens and underscores from an IBAN and uppercase it."""
+    return raw.translate(str.maketrans("", "", " -_")).upper()
+
+
 def ask_optional_iban(prompt: str, *, default: str = "") -> str:
     while True:
         display = f"{prompt} (blank = none) [{default}]: " if default else f"{prompt} (blank = none): "
         raw = input(display).strip()
         if not raw:
             return default
-        compact = raw.replace(" ", "").upper()
+        compact = _normalize_iban(raw)
         if len(compact) < 15 or not compact[:2].isalpha() or not compact[2:].isdigit():
             print("  Doesn't look like a valid IBAN.")
             continue
@@ -202,7 +207,7 @@ def ask_iban(*, default: str = "") -> str:
         raw = input(display).strip()
         if not raw:
             raw = default
-        raw = raw.replace(" ", "").upper()
+        raw = _normalize_iban(raw)
         if not raw:
             print("  (required)")
             continue
