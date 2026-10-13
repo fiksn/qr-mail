@@ -69,6 +69,12 @@ QR_SCALE_LADDER = (1.0, 0.5, 0.35, 0.25)
 # zbar even downscaled. Retry the whole ladder on a couple of rotated copies so a
 # skewed slip still decodes; 0° stays first so upright codes cost nothing extra.
 QR_ROTATIONS = (0, 45, 22)
+# Photos of a monitor carry moiré from the screen's pixel grid, which flips enough
+# modules that Reed-Solomon gives up (zxing reports ChecksumError on every attempt).
+# A Gaussian blur suppresses that high-frequency pattern. The radius is in
+# original-image pixels and shrinks with each downscale step; 2-3 px decodes real
+# 12 MP screen photos, 4 px already blurs neighbouring modules together.
+QR_MOIRE_BLUR_RADIUS = 2.5
 _AUTH_PASS_RE = re.compile(r"(?<![\w-])([a-z]+)=pass(?:[\s;(]|$)", re.IGNORECASE)
 _AUTH_PARAM_RE = re.compile(r"([A-Za-z0-9_.-]+)=([^;\s]+)")
 
@@ -230,7 +236,11 @@ def _suppress_fd_stderr() -> Any:
 
 
 def _decode_gray_over_scales(gray: Any) -> list[Any]:
-    """Decode a grayscale image across the downscale ladder; first hit wins."""
+    """Decode a grayscale image across the downscale ladder; first hit wins.
+
+    Each scale is tried as-is first, then with a moiré-suppressing blur.
+    """
+    from PIL import ImageFilter
     from pyzbar import pyzbar
 
     width, height = gray.size
@@ -240,8 +250,13 @@ def _decode_gray_over_scales(gray: Any) -> list[Any]:
         )
         results = pyzbar.decode(target, symbols=[pyzbar.ZBarSymbol.QRCODE])
         if results:
-            if scale != 1.0:
-                log.debug("QR decoded after downscaling to %.2fx", scale)
+            log.debug("QR decoded at %.2fx scale", scale)
+            return results
+        blur_radius = QR_MOIRE_BLUR_RADIUS * scale
+        blurred = target.filter(ImageFilter.GaussianBlur(blur_radius))
+        results = pyzbar.decode(blurred, symbols=[pyzbar.ZBarSymbol.QRCODE])
+        if results:
+            log.debug("QR decoded at %.2fx scale after %.2fpx blur", scale, blur_radius)
             return results
     return []
 
